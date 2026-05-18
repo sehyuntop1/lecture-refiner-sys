@@ -1,10 +1,11 @@
 import json
 import re
 import base64
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from config import GEMINI_API_KEY
 
-genai.configure(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 INPUT_PRICE_PER_1M = 0.30
 OUTPUT_PRICE_PER_1M = 2.50
@@ -23,11 +24,11 @@ def calculate_cost(input_tokens: int, output_tokens: int) -> dict:
 
 
 async def _generate(prompt: str) -> tuple[str, dict]:
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        generation_config=genai.GenerationConfig(temperature=0.0),
+    response = await client.aio.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.0),
     )
-    response = await model.generate_content_async(prompt)
     usage = response.usage_metadata
     cost = calculate_cost(usage.prompt_token_count, usage.candidates_token_count)
     return response.text, cost
@@ -39,7 +40,6 @@ async def extract_slide_texts_from_pdf(pdf_path: str) -> list[str]:
 
     doc = fitz.open(pdf_path)
     texts = []
-    model = genai.GenerativeModel(model_name="gemini-2.5-flash")
 
     for i, page in enumerate(doc):
         mat = fitz.Matrix(2, 2)
@@ -47,15 +47,13 @@ async def extract_slide_texts_from_pdf(pdf_path: str) -> list[str]:
         img_bytes = pix.tobytes("png")
 
         try:
-            response = await model.generate_content_async([
-                {
-                    "inline_data": {
-                        "mime_type": "image/png",
-                        "data": base64.b64encode(img_bytes).decode("utf-8"),
-                    }
-                },
-                "이 강의 슬라이드에 있는 모든 텍스트를 그대로 추출해주세요. 텍스트만 출력하고 다른 설명은 하지 마세요."
-            ])
+            response = await client.aio.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                    "이 강의 슬라이드에 있는 모든 텍스트를 그대로 추출해주세요. 텍스트만 출력하고 다른 설명은 하지 마세요."
+                ],
+            )
             texts.append(response.text.strip())
         except Exception:
             texts.append(f"(페이지 {i+1} 추출 실패)")
@@ -95,13 +93,15 @@ async def split_script_by_slides(slide_texts: list[str], raw_script: str, lectur
     text, cost = await _generate(prompt)
 
     try:
-        json_match = re.search(r"\{.*\}", text, re.DOTALL)
+        # ```json ... ``` 블록 제거 후 파싱
+        clean = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+        json_match = re.search(r"\{.*\}", clean, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group())
             pages = data.get("pages", [])
             result = {p["page"]: p.get("script", "해당 없음") for p in pages}
             return [result.get(i+1, "해당 없음") for i in range(total_pages)], cost
-    except:
+    except Exception as e:
         pass
 
     return ["해당 없음"] * total_pages, cost
