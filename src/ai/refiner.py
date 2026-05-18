@@ -1,6 +1,6 @@
 import json
 import re
-import base64
+import asyncio
 from google import genai
 from google.genai import types
 from config import GEMINI_API_KEY
@@ -23,15 +23,62 @@ def calculate_cost(input_tokens: int, output_tokens: int) -> dict:
     }
 
 
-async def _generate(prompt: str) -> tuple[str, dict]:
-    response = await client.aio.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.0),
-    )
-    usage = response.usage_metadata
-    cost = calculate_cost(usage.prompt_token_count, usage.candidates_token_count)
-    return response.text, cost
+async def _generate(prompt: str, max_retries: int = 5) -> tuple[str, dict]:
+    for attempt in range(max_retries):
+        try:
+            response = await client.aio.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.0),
+            )
+            usage = response.usage_metadata
+            cost = calculate_cost(usage.prompt_token_count, usage.candidates_token_count)
+            return response.text, cost
+
+        except Exception as e:
+            err_str = str(e)
+            is_retryable = (
+                "503" in err_str or
+                "504" in err_str or
+                "UNAVAILABLE" in err_str or
+                "CANCELLED" in err_str or
+                "429" in err_str
+            )
+            if is_retryable and attempt < max_retries - 1:
+                wait = 2 ** attempt
+                await asyncio.sleep(wait)
+                continue
+            else:
+                raise
+
+
+async def _generate_with_image(img_bytes: bytes, prompt: str, max_retries: int = 5) -> str:
+    for attempt in range(max_retries):
+        try:
+            response = await client.aio.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                    prompt,
+                ],
+            )
+            return response.text.strip()
+
+        except Exception as e:
+            err_str = str(e)
+            is_retryable = (
+                "503" in err_str or
+                "504" in err_str or
+                "UNAVAILABLE" in err_str or
+                "CANCELLED" in err_str or
+                "429" in err_str
+            )
+            if is_retryable and attempt < max_retries - 1:
+                wait = 2 ** attempt
+                await asyncio.sleep(wait)
+                continue
+            else:
+                raise
 
 
 async def extract_slide_texts_from_pdf(pdf_path: str) -> list[str]:
@@ -47,14 +94,11 @@ async def extract_slide_texts_from_pdf(pdf_path: str) -> list[str]:
         img_bytes = pix.tobytes("png")
 
         try:
-            response = await client.aio.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
-                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
-                    "이 강의 슬라이드에 있는 모든 텍스트를 그대로 추출해주세요. 텍스트만 출력하고 다른 설명은 하지 마세요."
-                ],
+            text = await _generate_with_image(
+                img_bytes,
+                "이 강의 슬라이드에 있는 모든 텍스트를 그대로 추출해주세요. 텍스트만 출력하고 다른 설명은 하지 마세요."
             )
-            texts.append(response.text.strip())
+            texts.append(text)
         except Exception:
             texts.append(f"(페이지 {i+1} 추출 실패)")
 
@@ -65,7 +109,7 @@ async def extract_slide_texts_from_pdf(pdf_path: str) -> list[str]:
 async def split_script_by_slides(slide_texts: list[str], raw_script: str, lecture_info: str) -> tuple[list[str], dict]:
     """1단계: 전체 대본을 슬라이드별로 분할"""
     total_pages = len(slide_texts)
-    slide_list = "\n".join([f"[슬라이드 {i+1}] {text[:200]}" for i, text in enumerate(slide_texts)])
+    slide_list = "\n".join([f"[슬라이드 {i+1}] {text[:100]}" for i, text in enumerate(slide_texts)])
 
     prompt = f"""당신은 의학과 강의 슬라이드와 대본을 매핑하는 전문가입니다.
 
@@ -93,7 +137,6 @@ async def split_script_by_slides(slide_texts: list[str], raw_script: str, lectur
     text, cost = await _generate(prompt)
 
     try:
-        # ```json ... ``` 블록 제거 후 파싱
         clean = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
         json_match = re.search(r"\{.*\}", clean, re.DOTALL)
         if json_match:
@@ -101,14 +144,14 @@ async def split_script_by_slides(slide_texts: list[str], raw_script: str, lectur
             pages = data.get("pages", [])
             result = {p["page"]: p.get("script", "해당 없음") for p in pages}
             return [result.get(i+1, "해당 없음") for i in range(total_pages)], cost
-    except Exception as e:
+    except Exception:
         pass
 
     return ["해당 없음"] * total_pages, cost
 
 
 async def refine_page_scripts(page_scripts: list[str], lecture_info: str) -> tuple[list[str], dict]:
-    """2단계: 10장씩 나눠서 정제 후 합본"""
+    """2단계: 10장씩 나눠서 bullet 변환 후 합본"""
     BATCH_SIZE = 10
     all_refined = []
     total_input = 0
@@ -123,26 +166,30 @@ async def refine_page_scripts(page_scripts: list[str], lecture_info: str) -> tup
             for i, script in enumerate(batch)
         ])
 
-        prompt = f"""당신은 의학과 강의 대본을 정제하는 전문가입니다.
+        prompt = f"""당신은 의학과 강의 대본을 정리하는 전문가입니다.
 아래는 {lecture_info} 강의의 슬라이드별 대본입니다.
-각 슬라이드 대본을 아래 조건에 따라 정제하되, [슬라이드 N] 형식은 반드시 유지하세요.
+각 슬라이드 대본을 bullet 포인트 형식으로 변환하되, [슬라이드 N] 형식은 반드시 유지하세요.
 
-[정제 조건]
-1. 오탈자 수정 (의학 용어 기준, 예: 셀롤라 타입 → cellular type(세포 타입))
-2. 콩글리시나 잘못된 영어 표현을 올바른 의학 영어로 수정
-3. 교수님 질문-학생 답변 대화 형식 유지
-4. 불필요한 미사여구 제거, 구어체는 반드시 유지
-5. 교수님 농담은 살리기
-6. 슬라이드 내용과 관련없는 교수님 사설, 개인적인 이야기, 주제 벗어난 잡담은 제거할 것 (단, 농담은 제외)
-7. 의학용어는 영어로 + 괄호 안에 한국어 번역 (예: smallpox(천연두))
-8. 절대 요약하지 말 것, 산문 형식 유지
-9. 강조/기억하라고 한 내용 반드시 살리기
-10. "해당 없음"인 슬라이드는 그대로 "해당 없음" 출력
+[변환 규칙]
+1. 구어체를 간결한 문어체 bullet 포인트(•)로 변환합니다.
+2. 의학 내용은 절대 빠뜨리지 말고 전부 bullet으로 담아주세요.
+3. bullet 하나당 하나의 개념/사실/흐름을 담습니다.
+4. 교수님이 강조한 내용("기억하세요", "외워두세요", "중요합니다" 등)은 bullet 앞에 ★ 표시를 붙여주세요.
+5. 공지사항, 출석, 과제, 잡담, 추임새는 제거합니다.
+6. 의학용어는 영어 + 괄호 안에 한국어로 표기합니다. 예: bilirubin(빌리루빈)
+7. 오탈자 및 잘못된 영어 표현은 올바른 의학 용어로 수정합니다.
+8. "해당 없음"인 슬라이드는 그대로 "해당 없음" 출력합니다.
+
+출력 형식 예시:
+[슬라이드 1]
+• bilirubin(빌리루빈)은 수용성이 아니므로 albumin(알부민)과 결합해 liver(간)로 이동
+★ conjugation(포합) 후 bile(담즙)을 통해 intestine(장)으로 배출 — 반드시 기억
+• intestine(장)에서 urobilinogen(유로빌리노겐)으로 전환
 
 [슬라이드별 대본]
 {combined}
 
-정제된 슬라이드별 대본만 출력하세요. [슬라이드 N] 형식 반드시 유지하면서 본문만 출력하세요.
+변환된 슬라이드별 bullet 대본만 출력하세요. [슬라이드 N] 형식 반드시 유지하세요.
 """
         text, cost = await _generate(prompt)
         total_input += cost["input_tokens"]
