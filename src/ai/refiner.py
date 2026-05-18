@@ -1,5 +1,7 @@
 import json
 import re
+import io
+import base64
 import google.generativeai as genai
 from config import GEMINI_API_KEY
 
@@ -30,6 +32,39 @@ async def _generate(prompt: str) -> tuple[str, dict]:
     usage = response.usage_metadata
     cost = calculate_cost(usage.prompt_token_count, usage.candidates_token_count)
     return response.text, cost
+
+
+async def extract_slide_texts_from_pdf(pdf_path: str) -> list[str]:
+    """PDF 슬라이드를 이미지로 변환 후 Gemini Vision으로 텍스트 추출"""
+    import fitz
+
+    doc = fitz.open(pdf_path)
+    texts = []
+    model = genai.GenerativeModel(model_name="gemini-2.5-flash")
+
+    for i, page in enumerate(doc):
+        # 페이지를 이미지로 변환
+        mat = fitz.Matrix(2, 2)
+        pix = page.get_pixmap(matrix=mat)
+        img_bytes = pix.tobytes("png")
+
+        # Gemini Vision으로 텍스트 추출
+        try:
+            response = await model.generate_content_async([
+                {
+                    "inline_data": {
+                        "mime_type": "image/png",
+                        "data": base64.b64encode(img_bytes).decode("utf-8"),
+                    }
+                },
+                "이 강의 슬라이드에 있는 모든 텍스트를 그대로 추출해주세요. 텍스트만 출력하고 다른 설명은 하지 마세요."
+            ])
+            texts.append(response.text.strip())
+        except Exception as e:
+            texts.append(f"(페이지 {i+1} 추출 실패)")
+
+    doc.close()
+    return texts
 
 
 async def split_script_by_slides(slide_texts: list[str], raw_script: str, lecture_info: str) -> tuple[list[str], dict]:
@@ -100,7 +135,6 @@ async def refine_page_scripts(page_scripts: list[str], lecture_info: str) -> tup
 """
     text, cost = await _generate(prompt)
 
-    # [슬라이드 N] 기준으로 파싱
     refined = []
     pattern = re.split(r'\[슬라이드 \d+\]', text)
     pattern = [p.strip() for p in pattern if p.strip()]
@@ -108,7 +142,7 @@ async def refine_page_scripts(page_scripts: list[str], lecture_info: str) -> tup
     if len(pattern) == len(page_scripts):
         refined = pattern
     else:
-        refined = page_scripts  # 파싱 실패시 원본 사용
+        refined = page_scripts
 
     return refined, cost
 
@@ -138,14 +172,3 @@ async def extract_emphasis(raw_script: str, lecture_info: str) -> tuple[str, dic
 발췌 내용만 출력하세요.
 """
     return await _generate(prompt)
-
-
-async def extract_slide_texts_from_pdf(pdf_path: str) -> list[str]:
-    import fitz
-    doc = fitz.open(pdf_path)
-    texts = []
-    for page in doc:
-        text = page.get_text().strip()
-        texts.append(text if text else "(텍스트 없음)")
-    doc.close()
-    return texts
