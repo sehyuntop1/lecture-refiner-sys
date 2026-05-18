@@ -1,40 +1,74 @@
-from src.ai.gemini_client import generate
+import google.generativeai as genai
+from config import GEMINI_API_KEY
 
-REFINE_PROMPT = """
-당신은 의학과 강의 대본을 다듬는 전문가입니다.
-아래는 {lecture_info} 강의 대본입니다. 다음 조건을 반드시 지켜 다듬어 주세요.
+genai.configure(api_key=GEMINI_API_KEY)
 
-[조건1] 오탈자를 수정하되, 의학과에서 쓰는 용어에 맞게 오탈자 수정
-- 예시) 미토콘돌아 → 미토콘드리아
+# 요금 설정 (Gemini 2.5 Flash)
+INPUT_PRICE_PER_1M = 0.30
+OUTPUT_PRICE_PER_1M = 2.50
+KRW_RATE = 1350
 
-[조건2] 교수님이 예시로 들기 위해 학생에게 질문을 했다면 대화 형식을 지켜 살릴 것
-- 예시) 교수님: 질문내용 / 학생: 답변내용
 
-[조건3] 불필요한 미사여구는 지우고 맥락에 맞게 문장을 읽기 쉬운 형태로 바꿀 것.
-단, 문장의 형식을 지키기 위해 언급하셨던 의학 관련 단어들은 반드시 살려야 함
-- 예시) cell의 aging은... 어 노화가 이제 → cell의 aging은 이제
+def calculate_cost(input_tokens: int, output_tokens: int) -> dict:
+    input_cost = (input_tokens / 1_000_000) * INPUT_PRICE_PER_1M * KRW_RATE
+    output_cost = (output_tokens / 1_000_000) * OUTPUT_PRICE_PER_1M * KRW_RATE
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "cost_krw": input_cost + output_cost,
+    }
 
-[조건4] 교수님의 농담을 지우지 않고 반드시 살리기
 
-[조건5] 의학용어가 쓰여있다면 영어로 바꿔주고 옆에 괄호로 한국어 번역을 해줄 것
-- 예시) smallpox(천연두)
+async def _generate(prompt: str) -> tuple[str, dict]:
+    model = genai.GenerativeModel(
+        model_name="gemini-2.5-flash",
+        generation_config=genai.GenerationConfig(temperature=0.0),
+    )
+    response = await model.generate_content_async(prompt)
+    usage = response.usage_metadata
+    cost = calculate_cost(usage.prompt_token_count, usage.candidates_token_count)
+    return response.text, cost
 
-[조건6] 내용을 정리, 요약하여 줄이지 말고 교수님의 강의라는 틀을 벗어나지 말 것.
-구두로 말했다는 걸 기억하고 산문 형식을 엄수
 
-[조건7] 예시로 든 내용도 담고 절대로 텍스트의 내용을 임의로 요약하지 말 것. 절대로 요약하지 말 것!
+async def map_script_to_pages(slide_texts: list[str], raw_script: str, lecture_info: str) -> tuple[str, dict]:
+    """슬라이드 한 장씩 대본 매핑"""
+    results = []
+    total_input = 0
+    total_output = 0
 
-[조건8] 교수님이 기억하라고 하거나, 상식으로 알아두라거나 하는 언급이 있는 건 반드시 내용을 살려두기
+    for i, slide_text in enumerate(slide_texts):
+        page_num = i + 1
+        prompt = f"""
+당신은 의학과 강의 슬라이드와 대본을 매핑하는 전문가입니다.
 
-[조건9] 파일이 여러 개라면 순번 순서대로 이어붙여 하나의 합본으로 만들 것
+아래는 {lecture_info} 강의의 슬라이드 {page_num}페이지 내용입니다.
+이 슬라이드를 설명하는 대본 부분을 찾아서 그대로 발췌해주세요.
 
-원본 대본:
+[슬라이드 {page_num} 내용]
+{slide_text}
+
+[전체 강의 대본]
 {raw_script}
 
-다듬은 대본만 출력하세요. 다른 설명이나 머릿말 없이 바로 본문만 출력하세요.
+규칙:
+- 이 슬라이드와 관련된 대본 내용만 발췌
+- 원문 그대로 발췌 (수정 금지)
+- 관련 내용이 없으면 "해당 없음" 출력
+- 다른 설명 없이 발췌 내용만 출력
 """
+        text, cost = await _generate(prompt)
+        total_input += cost["input_tokens"]
+        total_output += cost["output_tokens"]
+        results.append(f"[슬라이드 {page_num}]\n{text.strip()}")
 
-EMPHASIS_PROMPT = """
+    final_text = "\n\n".join(results)
+    total_cost = calculate_cost(total_input, total_output)
+    return final_text, total_cost
+
+
+async def extract_emphasis(raw_script: str, lecture_info: str) -> tuple[str, dict]:
+    prompt = f"""
 당신은 의학과 시험 준비를 돕는 전문가입니다.
 아래는 {lecture_info} 강의 대본입니다.
 
@@ -57,21 +91,18 @@ EMPHASIS_PROMPT = """
 원본 대본:
 {raw_script}
 
-중요 의학 내용 발췌본만 출력하세요. 다른 설명 없이 바로 발췌 내용만 출력하세요.
+중요 의학 내용 발췌본만 출력하세요.
 """
+    return await _generate(prompt)
 
 
-async def refine_script(raw_script: str, lecture_info: str) -> str:
-    prompt = REFINE_PROMPT.format(
-        lecture_info=lecture_info,
-        raw_script=raw_script,
-    )
-    return await generate(prompt, temperature=0.0)
-
-
-async def extract_emphasis(raw_script: str, lecture_info: str) -> str:
-    prompt = EMPHASIS_PROMPT.format(
-        lecture_info=lecture_info,
-        raw_script=raw_script,
-    )
-    return await generate(prompt, temperature=0.0)
+async def extract_slide_texts_from_pdf(pdf_path: str) -> list[str]:
+    """PDF에서 슬라이드 텍스트 추출"""
+    import fitz
+    doc = fitz.open(pdf_path)
+    texts = []
+    for page in doc:
+        text = page.get_text().strip()
+        texts.append(text if text else "(텍스트 없음)")
+    doc.close()
+    return texts
