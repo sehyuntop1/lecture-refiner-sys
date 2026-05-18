@@ -1,4 +1,3 @@
-import asyncio
 import os
 import tempfile
 
@@ -13,7 +12,13 @@ from telegram.ext import (
 )
 
 from config import TELEGRAM_BOT_TOKEN
-from src.ai.refiner import map_and_refine_script, extract_emphasis, extract_slide_texts_from_pdf, calculate_cost
+from src.ai.refiner import (
+    split_script_by_slides,
+    refine_page_scripts,
+    extract_emphasis,
+    extract_slide_texts_from_pdf,
+    calculate_cost,
+)
 
 WAIT_INFO, WAIT_FILES = range(2)
 
@@ -115,87 +120,59 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
+        # 슬라이드 텍스트 추출
         slide_texts = await extract_slide_texts_from_pdf(pdf_path)
         total_pages = len(slide_texts)
+        total_input = 0
+        total_output = 0
 
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"1/2 페이지별 매핑 + 정제 중... (0/{total_pages})"
+            f"1/3 슬라이드별 대본 분할 중..."
         )
 
-        # 페이지별 매핑 + 정제 (10장씩 진행상황 업데이트)
-        results = []
-        total_input = 0
-        total_output = 0
-
-        import google.generativeai as genai
-        from config import GEMINI_API_KEY
-        genai.configure(api_key=GEMINI_API_KEY)
-
-        BATCH_SIZE = 10
-        for batch_start in range(0, total_pages, BATCH_SIZE):
-            batch_end = min(batch_start + BATCH_SIZE, total_pages)
-            batch_texts = slide_texts[batch_start:batch_end]
-
-            for i, slide_text in enumerate(batch_texts):
-                page_num = batch_start + i + 1
-                model = genai.GenerativeModel(
-                    model_name="gemini-2.5-flash",
-                    generation_config=genai.GenerationConfig(temperature=0.0),
-                )
-                prompt = f"""
-당신은 의학과 강의 슬라이드와 대본을 매핑하고 정제하는 전문가입니다.
-
-아래는 {lecture_info} 강의의 슬라이드 {page_num}페이지 내용입니다.
-전체 강의 대본에서 이 슬라이드를 설명하는 부분을 찾아서 발췌하되, 동시에 아래 정제 조건에 따라 다듬어주세요.
-
-[슬라이드 {page_num} 내용]
-{slide_text}
-
-[전체 강의 대본]
-{raw_script}
-
-[정제 조건]
-1. 오탈자를 수정하되, 의학 용어에 맞게 수정 (예: 미토콘돌아 → 미토콘드리아)
-2. 교수님이 학생에게 질문한 경우 대화 형식 유지 (교수님: 질문 / 학생: 답변)
-3. 불필요한 미사여구 제거, 구어체는 반드시 유지할 것
-4. 교수님 농담 살리기
-5. 의학용어는 영어로 + 괄호 안에 한국어 번역 (예: smallpox(천연두))
-6. 절대 요약하지 말 것. 산문 형식 유지
-7. 강조하거나 기억하라고 한 내용 반드시 살리기
-8. 관련 내용이 없으면 "해당 없음" 출력
-
-정제된 발췌 내용만 출력하세요. 다른 설명 없이 바로 본문만 출력하세요.
-"""
-                response = await model.generate_content_async(prompt)
-                usage = response.usage_metadata
-                total_input += usage.prompt_token_count
-                total_output += usage.candidates_token_count
-                results.append(f"[슬라이드 {page_num}]\n{response.text.strip()}")
-
-            await status_msg.edit_text(
-                f"⏳ 처리 중입니다...\n"
-                f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-                f"1/2 페이지별 매핑 + 정제 중... ({batch_end}/{total_pages})"
-            )
-
-        mapped_text = "\n\n".join(results)
+        # 1단계: 분할
+        page_scripts, split_cost = await split_script_by_slides(slide_texts, raw_script, lecture_info)
+        total_input += split_cost["input_tokens"]
+        total_output += split_cost["output_tokens"]
 
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
-            f"✅ 1/2 페이지별 매핑 + 정제 완료\n"
-            f"2/2 중요 내용 발췌 중..."
+            f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
+            f"✅ 1/3 슬라이드별 분할 완료\n"
+            f"2/3 대본 정제 중..."
         )
 
+        # 2단계: 정제
+        refined_scripts, refine_cost = await refine_page_scripts(page_scripts, lecture_info)
+        total_input += refine_cost["input_tokens"]
+        total_output += refine_cost["output_tokens"]
+
+        await status_msg.edit_text(
+            f"⏳ 처리 중입니다...\n"
+            f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
+            f"✅ 1/3 슬라이드별 분할 완료\n"
+            f"✅ 2/3 대본 정제 완료\n"
+            f"3/3 중요 내용 발췌 중..."
+        )
+
+        # 3단계: 중요 내용
         emphasis_text, emphasis_cost = await extract_emphasis(raw_script, lecture_info)
         total_input += emphasis_cost["input_tokens"]
         total_output += emphasis_cost["output_tokens"]
 
         total_cost = calculate_cost(total_input, total_output)
 
+        # 페이지별 정제본 만들기
+        mapped_text = "\n\n".join([
+            f"[슬라이드 {i+1}]\n{script}"
+            for i, script in enumerate(refined_scripts)
+        ])
+
         await status_msg.edit_text("✅ 완료! 파일 전송 중...")
 
+        # 파일 전송
         await update.message.reply_document(
             document=mapped_text.encode("utf-8"),
             filename=f"{lecture_info}_페이지별정제본.txt",
