@@ -3,7 +3,6 @@ from config import GEMINI_API_KEY
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# 요금 설정 (Gemini 2.5 Flash)
 INPUT_PRICE_PER_1M = 0.30
 OUTPUT_PRICE_PER_1M = 2.50
 KRW_RATE = 1350
@@ -31,8 +30,8 @@ async def _generate(prompt: str) -> tuple[str, dict]:
     return response.text, cost
 
 
-async def map_script_to_pages(slide_texts: list[str], raw_script: str, lecture_info: str) -> tuple[str, dict]:
-    """슬라이드 한 장씩 대본 매핑"""
+async def map_and_refine_script(slide_texts: list[str], raw_script: str, lecture_info: str) -> tuple[str, dict]:
+    """슬라이드 한 장씩 대본 매핑 + 정제 동시 수행"""
     results = []
     total_input = 0
     total_output = 0
@@ -40,10 +39,10 @@ async def map_script_to_pages(slide_texts: list[str], raw_script: str, lecture_i
     for i, slide_text in enumerate(slide_texts):
         page_num = i + 1
         prompt = f"""
-당신은 의학과 강의 슬라이드와 대본을 매핑하는 전문가입니다.
+당신은 의학과 강의 슬라이드와 대본을 매핑하고 정제하는 전문가입니다.
 
 아래는 {lecture_info} 강의의 슬라이드 {page_num}페이지 내용입니다.
-이 슬라이드를 설명하는 대본 부분을 찾아서 그대로 발췌해주세요.
+전체 강의 대본에서 이 슬라이드를 설명하는 부분을 찾아서 발췌하되, 동시에 아래 정제 조건에 따라 다듬어주세요.
 
 [슬라이드 {page_num} 내용]
 {slide_text}
@@ -51,11 +50,17 @@ async def map_script_to_pages(slide_texts: list[str], raw_script: str, lecture_i
 [전체 강의 대본]
 {raw_script}
 
-규칙:
-- 이 슬라이드와 관련된 대본 내용만 발췌
-- 원문 그대로 발췌 (수정 금지)
-- 관련 내용이 없으면 "해당 없음" 출력
-- 다른 설명 없이 발췌 내용만 출력
+[정제 조건]
+1. 오탈자를 수정하되, 의학 용어에 맞게 수정 (예: 미토콘돌아 → 미토콘드리아)
+2. 교수님이 학생에게 질문한 경우 대화 형식 유지 (교수님: 질문 / 학생: 답변)
+3. 불필요한 미사여구 제거, 구어체는 반드시 유지할 것
+4. 교수님 농담 살리기
+5. 의학용어는 영어로 + 괄호 안에 한국어 번역 (예: smallpox(천연두))
+6. 절대 요약하지 말 것. 산문 형식 유지
+7. 강조하거나 기억하라고 한 내용 반드시 살리기
+8. 관련 내용이 없으면 "해당 없음" 출력
+
+정제된 발췌 내용만 출력하세요. 다른 설명 없이 바로 본문만 출력하세요.
 """
         text, cost = await _generate(prompt)
         total_input += cost["input_tokens"]
@@ -97,7 +102,6 @@ async def extract_emphasis(raw_script: str, lecture_info: str) -> tuple[str, dic
 
 
 async def extract_slide_texts_from_pdf(pdf_path: str) -> list[str]:
-    """PDF에서 슬라이드 텍스트 추출"""
     import fitz
     doc = fitz.open(pdf_path)
     texts = []

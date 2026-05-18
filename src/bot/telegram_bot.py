@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 
 from config import TELEGRAM_BOT_TOKEN
-from src.ai.refiner import map_script_to_pages, extract_emphasis, extract_slide_texts_from_pdf
+from src.ai.refiner import map_and_refine_script, extract_emphasis, extract_slide_texts_from_pdf, calculate_cost
 
 WAIT_INFO, WAIT_FILES = range(2)
 
@@ -61,7 +61,6 @@ async def receive_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fname = document.file_name.lower()
 
     if fname.endswith(".pdf"):
-        # PDF 저장
         file = await document.get_file()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             await file.download_to_drive(tmp.name)
@@ -69,7 +68,6 @@ async def receive_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ PDF 수신 완료! ({document.file_name})")
 
     elif fname.endswith(".txt"):
-        # txt 저장
         file = await document.get_file()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
             await file.download_to_drive(tmp.name)
@@ -108,27 +106,25 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lecture_info = session["lecture_info"]
     pdf_path = session["pdf_path"]
 
-    # 대본 합본
     session["txt_files"].sort(key=lambda x: x["name"])
     raw_script = "\n\n".join([f["content"] for f in session["txt_files"]])
 
     status_msg = await update.message.reply_text(
         "⏳ 처리 중입니다...\n"
-        "1/2 슬라이드 텍스트 추출 중..."
+        "슬라이드 텍스트 추출 중..."
     )
 
     try:
-        # 1단계: 슬라이드 텍스트 추출
         slide_texts = await extract_slide_texts_from_pdf(pdf_path)
         total_pages = len(slide_texts)
 
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"1/2 페이지별 대본 매핑 중... (0/{total_pages})"
+            f"1/2 페이지별 매핑 + 정제 중... (0/{total_pages})"
         )
 
-        # 2단계: 페이지별 매핑 (10장씩 진행상황 업데이트)
+        # 페이지별 매핑 + 정제 (10장씩 진행상황 업데이트)
         results = []
         total_input = 0
         total_output = 0
@@ -149,10 +145,10 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     generation_config=genai.GenerationConfig(temperature=0.0),
                 )
                 prompt = f"""
-당신은 의학과 강의 슬라이드와 대본을 매핑하는 전문가입니다.
+당신은 의학과 강의 슬라이드와 대본을 매핑하고 정제하는 전문가입니다.
 
 아래는 {lecture_info} 강의의 슬라이드 {page_num}페이지 내용입니다.
-이 슬라이드를 설명하는 대본 부분을 찾아서 그대로 발췌해주세요.
+전체 강의 대본에서 이 슬라이드를 설명하는 부분을 찾아서 발췌하되, 동시에 아래 정제 조건에 따라 다듬어주세요.
 
 [슬라이드 {page_num} 내용]
 {slide_text}
@@ -160,11 +156,17 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 [전체 강의 대본]
 {raw_script}
 
-규칙:
-- 이 슬라이드와 관련된 대본 내용만 발췌
-- 원문 그대로 발췌 (수정 금지)
-- 관련 내용이 없으면 "해당 없음" 출력
-- 다른 설명 없이 발췌 내용만 출력
+[정제 조건]
+1. 오탈자를 수정하되, 의학 용어에 맞게 수정 (예: 미토콘돌아 → 미토콘드리아)
+2. 교수님이 학생에게 질문한 경우 대화 형식 유지 (교수님: 질문 / 학생: 답변)
+3. 불필요한 미사여구 제거, 구어체는 반드시 유지할 것
+4. 교수님 농담 살리기
+5. 의학용어는 영어로 + 괄호 안에 한국어 번역 (예: smallpox(천연두))
+6. 절대 요약하지 말 것. 산문 형식 유지
+7. 강조하거나 기억하라고 한 내용 반드시 살리기
+8. 관련 내용이 없으면 "해당 없음" 출력
+
+정제된 발췌 내용만 출력하세요. 다른 설명 없이 바로 본문만 출력하세요.
 """
                 response = await model.generate_content_async(prompt)
                 usage = response.usage_metadata
@@ -175,50 +177,43 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text(
                 f"⏳ 처리 중입니다...\n"
                 f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-                f"1/2 페이지별 대본 매핑 중... ({batch_end}/{total_pages})"
+                f"1/2 페이지별 매핑 + 정제 중... ({batch_end}/{total_pages})"
             )
 
         mapped_text = "\n\n".join(results)
 
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
-            f"✅ 1/2 페이지별 매핑 완료\n"
+            f"✅ 1/2 페이지별 매핑 + 정제 완료\n"
             f"2/2 중요 내용 발췌 중..."
         )
 
-        # 3단계: 중요 내용 발췌
         emphasis_text, emphasis_cost = await extract_emphasis(raw_script, lecture_info)
         total_input += emphasis_cost["input_tokens"]
         total_output += emphasis_cost["output_tokens"]
 
-        # 비용 계산
-        from src.ai.refiner import calculate_cost
         total_cost = calculate_cost(total_input, total_output)
 
         await status_msg.edit_text("✅ 완료! 파일 전송 중...")
 
-        # 페이지별 대본 전송
         await update.message.reply_document(
             document=mapped_text.encode("utf-8"),
-            filename=f"{lecture_info}_페이지별대본.txt",
-            caption="📄 슬라이드 페이지별 대본입니다. 검토 후 첫 번째 봇에 사용하세요!",
+            filename=f"{lecture_info}_페이지별정제본.txt",
+            caption="📄 슬라이드 페이지별 정제된 대본입니다. 검토 후 첫 번째 봇에 사용하세요!",
         )
 
-        # 중요 내용 전송
         await update.message.reply_document(
             document=emphasis_text.encode("utf-8"),
             filename=f"{lecture_info}_중요내용.txt",
             caption="⭐ 교수님이 강조하신 중요 내용 모음입니다.",
         )
 
-        # 비용 알림
         await update.message.reply_text(
             f"💰 이번 사용량\n"
             f"총 토큰: {total_cost['total_tokens']:,}개\n"
             f"예상 비용: 약 ₩{total_cost['cost_krw']:.1f}원"
         )
 
-        # 정리
         os.remove(pdf_path)
         del user_sessions[user_id]
 
