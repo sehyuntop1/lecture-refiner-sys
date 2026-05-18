@@ -1,6 +1,5 @@
 import json
 import re
-import io
 import base64
 import google.generativeai as genai
 from config import GEMINI_API_KEY
@@ -43,12 +42,10 @@ async def extract_slide_texts_from_pdf(pdf_path: str) -> list[str]:
     model = genai.GenerativeModel(model_name="gemini-2.5-flash")
 
     for i, page in enumerate(doc):
-        # 페이지를 이미지로 변환
         mat = fitz.Matrix(2, 2)
         pix = page.get_pixmap(matrix=mat)
         img_bytes = pix.tobytes("png")
 
-        # Gemini Vision으로 텍스트 추출
         try:
             response = await model.generate_content_async([
                 {
@@ -60,7 +57,7 @@ async def extract_slide_texts_from_pdf(pdf_path: str) -> list[str]:
                 "이 강의 슬라이드에 있는 모든 텍스트를 그대로 추출해주세요. 텍스트만 출력하고 다른 설명은 하지 마세요."
             ])
             texts.append(response.text.strip())
-        except Exception as e:
+        except Exception:
             texts.append(f"(페이지 {i+1} 추출 실패)")
 
     doc.close()
@@ -111,40 +108,55 @@ async def split_script_by_slides(slide_texts: list[str], raw_script: str, lectur
 
 
 async def refine_page_scripts(page_scripts: list[str], lecture_info: str) -> tuple[list[str], dict]:
-    """2단계: 분할된 대본 정제"""
-    combined = "\n\n".join([f"[슬라이드 {i+1}]\n{script}" for i, script in enumerate(page_scripts)])
+    """2단계: 10장씩 나눠서 정제 후 합본"""
+    BATCH_SIZE = 10
+    all_refined = []
+    total_input = 0
+    total_output = 0
 
-    prompt = f"""당신은 의학과 강의 대본을 정제하는 전문가입니다.
+    for batch_start in range(0, len(page_scripts), BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, len(page_scripts))
+        batch = page_scripts[batch_start:batch_end]
+
+        combined = "\n\n".join([
+            f"[슬라이드 {batch_start + i + 1}]\n{script}"
+            for i, script in enumerate(batch)
+        ])
+
+        prompt = f"""당신은 의학과 강의 대본을 정제하는 전문가입니다.
 아래는 {lecture_info} 강의의 슬라이드별 대본입니다.
 각 슬라이드 대본을 아래 조건에 따라 정제하되, [슬라이드 N] 형식은 반드시 유지하세요.
 
 [정제 조건]
-1. 오탈자 수정 (의학 용어 기준, 예: 미토콘돌아 → 미토콘드리아)
-2. 교수님 질문-학생 답변 대화 형식 유지
-3. 불필요한 미사여구 제거, 구어체는 반드시 유지
-4. 교수님 농담 살리기
-5. 의학용어 영어로 + 괄호 안에 한국어 (예: smallpox(천연두))
-6. 절대 요약하지 말 것, 산문 형식 유지
-7. 강조/기억하라고 한 내용 반드시 살리기
-8. "해당 없음"인 슬라이드는 그대로 "해당 없음" 출력
+1. 오탈자 수정 (의학 용어 기준, 예: 셀롤라 타입 → cellular type(세포 타입))
+2. 콩글리시나 잘못된 영어 표현을 올바른 의학 영어로 수정
+3. 교수님 질문-학생 답변 대화 형식 유지
+4. 불필요한 미사여구 제거, 구어체는 반드시 유지
+5. 교수님 농담은 살리기
+6. 슬라이드 내용과 관련없는 교수님 사설, 개인적인 이야기, 주제 벗어난 잡담은 제거할 것 (단, 농담은 제외)
+7. 의학용어는 영어로 + 괄호 안에 한국어 번역 (예: smallpox(천연두))
+8. 절대 요약하지 말 것, 산문 형식 유지
+9. 강조/기억하라고 한 내용 반드시 살리기
+10. "해당 없음"인 슬라이드는 그대로 "해당 없음" 출력
 
 [슬라이드별 대본]
 {combined}
 
-정제된 슬라이드별 대본만 출력하세요. [슬라이드 N] 형식 유지하면서 본문만 출력하세요.
+정제된 슬라이드별 대본만 출력하세요. [슬라이드 N] 형식 반드시 유지하면서 본문만 출력하세요.
 """
-    text, cost = await _generate(prompt)
+        text, cost = await _generate(prompt)
+        total_input += cost["input_tokens"]
+        total_output += cost["output_tokens"]
 
-    refined = []
-    pattern = re.split(r'\[슬라이드 \d+\]', text)
-    pattern = [p.strip() for p in pattern if p.strip()]
+        parts = re.split(r'\[슬라이드 \d+\]', text)
+        parts = [p.strip() for p in parts if p.strip()]
 
-    if len(pattern) == len(page_scripts):
-        refined = pattern
-    else:
-        refined = page_scripts
+        if len(parts) == len(batch):
+            all_refined.extend(parts)
+        else:
+            all_refined.extend(batch)
 
-    return refined, cost
+    return all_refined, calculate_cost(total_input, total_output)
 
 
 async def extract_emphasis(raw_script: str, lecture_info: str) -> tuple[str, dict]:
@@ -162,7 +174,7 @@ async def extract_emphasis(raw_script: str, lecture_info: str) -> tuple[str, dic
 - AI, 기술 사용법, 수업 운영 방식
 - 공지사항, 출석, 과제
 - 강조 없는 단순 예시/비유
-- 농담, 잡담
+- 농담, 잡담, 사설
 
 형식: [중요] 발췌한 의학 내용
 
