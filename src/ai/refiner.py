@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import json
 import re
 import asyncio
@@ -149,7 +150,6 @@ async def split_script_by_slides(slide_texts: list[str], raw_script: str, lectur
 
 
 async def refine_page_scripts(page_scripts: list[str], lecture_info: str) -> tuple[list[str], dict]:
-    """2단계: 10장씩 나눠서 정제 후 합본"""
     BATCH_SIZE = 10
     all_refined = []
     total_input = 0
