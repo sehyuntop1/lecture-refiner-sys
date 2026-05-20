@@ -28,7 +28,7 @@ async def _generate(prompt: str, max_retries: int = 5) -> tuple[str, dict]:
     for attempt in range(max_retries):
         try:
             response = await client.aio.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-2.0-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(temperature=0.0),
             )
@@ -57,7 +57,7 @@ async def _generate_with_image(img_bytes: bytes, prompt: str, max_retries: int =
     for attempt in range(max_retries):
         try:
             response = await client.aio.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-2.0-flash",
                 contents=[
                     types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
                     prompt,
