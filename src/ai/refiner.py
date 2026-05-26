@@ -113,7 +113,14 @@ async def split_script_by_slides(slide_texts: list[str], raw_script: str, lectur
     prompt = f"""당신은 의학과 강의 슬라이드와 대본을 매핑하는 전문가입니다.
 
 아래는 {lecture_info} 강의입니다.
-전체 강의 대본을 슬라이드 {total_pages}페이지에 맞게 분할해주세요.
+각 슬라이드에 해당하는 대본 내용을 찾아서 매핑해주세요.
+
+[매핑 규칙 - 반드시 준수]
+1. 각 슬라이드의 주제/키워드와 대본 내용을 비교해서 실제로 관련있는 내용만 매핑하세요.
+2. 교수님이 해당 슬라이드를 설명하지 않고 넘어간 경우 script를 반드시 "해당 없음"으로 하세요.
+3. 대본 내용을 억지로 빈 슬라이드에 채워넣지 마세요.
+4. 같은 대본 내용을 여러 슬라이드에 중복 사용하지 마세요.
+5. 순서대로 분배하지 말고, 슬라이드 내용과 대본 내용의 주제가 실제로 일치할 때만 매핑하세요.
 
 [슬라이드 목록]
 {slide_list}
@@ -125,12 +132,10 @@ async def split_script_by_slides(slide_texts: list[str], raw_script: str, lectur
 {{
   "pages": [
     {{"page": 1, "script": "슬라이드 1에 해당하는 대본 내용"}},
-    {{"page": 2, "script": "슬라이드 2에 해당하는 대본 내용"}}
+    {{"page": 2, "script": "해당 없음"}}
   ]
 }}
 
-- 관련 내용 없으면 script를 "해당 없음"으로
-- 전체 대본 내용이 빠지지 않게 분배
 - JSON만 출력, 다른 설명 없이
 """
     text, cost = await _generate(prompt)
