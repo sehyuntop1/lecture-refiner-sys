@@ -129,18 +129,20 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"1/3 슬라이드별 대본 분할 중..."
+            f"1/3 대본 청크 단위 슬라이드 매핑 중...\n"
+            f"(건너뛴 슬라이드 감지 포함, 잠시만 기다려주세요)"
         )
 
         # 1단계: 분할
         page_scripts, split_cost = await split_script_by_slides(slide_texts, raw_script, lecture_info)
+        skipped = sum(1 for s in page_scripts if s == "해당 없음")
         total_input += split_cost["input_tokens"]
         total_output += split_cost["output_tokens"]
 
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"✅ 1/3 슬라이드별 분할 완료\n"
+            f"✅ 1/3 매핑 완료 (건너뛴 슬라이드: {skipped}개)\n"
             f"2/3 대본 정제 중..."
         )
 
