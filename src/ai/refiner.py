@@ -308,17 +308,13 @@ async def review_mapping(
         # 주변 슬라이드 텍스트
         start = max(0, prob_slide - 4)
         end = min(total_pages, prob_slide + 3)
-        nearby_slides = "
-".join([
+        nearby_slides = "\n".join([
             f"[슬라이드 {j+1}] {' '.join(slide_texts[j].split())[:300]}"
             for j in range(start, end)
         ])
 
-        chunks_text = "
-
-".join([
-            f"[청크 {idx+1}]
-{c}" for idx, c in assigned_chunks
+        chunks_text = "\n\n".join([
+            f"[청크 {idx+1}]\n{c}" for idx, c in assigned_chunks
         ])
 
         prompt = f"""당신은 의학 강의 대본과 슬라이드 매핑을 검토하는 전문가입니다.
@@ -375,8 +371,7 @@ async def review_mapping(
     reviewed_scripts = []
     for i in range(1, total_pages + 1):
         if slide_chunks[i]:
-            reviewed_scripts.append("
-".join(slide_chunks[i]))
+            reviewed_scripts.append("\n".join(slide_chunks[i]))
         else:
             reviewed_scripts.append("해당 없음")
 
