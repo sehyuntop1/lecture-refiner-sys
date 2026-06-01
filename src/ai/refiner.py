@@ -24,7 +24,8 @@ def calculate_cost(input_tokens: int, output_tokens: int) -> dict:
     }
 
 
-async def _generate(prompt: str, max_retries: int = 5) -> tuple[str, dict]:
+async def _generate(prompt: str, max_retries: int = 10) -> tuple[str, dict]:
+    import random
     for attempt in range(max_retries):
         try:
             response = await client.aio.models.generate_content(
@@ -43,17 +44,23 @@ async def _generate(prompt: str, max_retries: int = 5) -> tuple[str, dict]:
                 "504" in err_str or
                 "UNAVAILABLE" in err_str or
                 "CANCELLED" in err_str or
-                "429" in err_str
+                "429" in err_str or
+                "overloaded" in err_str.lower() or
+                "high demand" in err_str.lower()
             )
             if is_retryable and attempt < max_retries - 1:
-                wait = 2 ** attempt
+                # exponential backoff + jitter (최대 60초)
+                base_wait = min(2 ** attempt, 60)
+                jitter = random.uniform(0, base_wait * 0.3)
+                wait = base_wait + jitter
                 await asyncio.sleep(wait)
                 continue
             else:
                 raise
 
 
-async def _generate_with_image(img_bytes: bytes, prompt: str, max_retries: int = 5) -> str:
+async def _generate_with_image(img_bytes: bytes, prompt: str, max_retries: int = 10) -> str:
+    import random
     for attempt in range(max_retries):
         try:
             response = await client.aio.models.generate_content(
@@ -72,10 +79,14 @@ async def _generate_with_image(img_bytes: bytes, prompt: str, max_retries: int =
                 "504" in err_str or
                 "UNAVAILABLE" in err_str or
                 "CANCELLED" in err_str or
-                "429" in err_str
+                "429" in err_str or
+                "overloaded" in err_str.lower() or
+                "high demand" in err_str.lower()
             )
             if is_retryable and attempt < max_retries - 1:
-                wait = 2 ** attempt
+                base_wait = min(2 ** attempt, 60)
+                jitter = random.uniform(0, base_wait * 0.3)
+                wait = base_wait + jitter
                 await asyncio.sleep(wait)
                 continue
             else:
@@ -138,20 +149,19 @@ async def split_script_by_slides(
     total_input = 0
     total_output = 0
 
-    # ── 슬라이드 목록 (전체 텍스트 제공, 단 300자 이내로 요약)
+    # ── 슬라이드 목록 (500자로 확대, 줄바꿈 제거)
     slide_list_lines = []
     for i, text in enumerate(slide_texts):
-        # 줄바꿈 제거 후 300자
-        one_line = " ".join(text.split())[:300]
+        one_line = " ".join(text.split())[:500]
         slide_list_lines.append(f"[슬라이드 {i+1}] {one_line}")
     full_slide_list = "\n".join(slide_list_lines)
 
-    # ── 대본을 ~600자 청크로 분할 (문장 경계 존중)
+    # ── 대본을 ~300자 청크로 분할 (슬라이드 전환점 정밀 감지)
     sentences = _split_script_into_sentences(raw_script)
     chunks: list[str] = []
     current_chunk = ""
     for sent in sentences:
-        if len(current_chunk) + len(sent) > 600 and current_chunk:
+        if len(current_chunk) + len(sent) > 300 and current_chunk:
             chunks.append(current_chunk.strip())
             current_chunk = sent
         else:
@@ -162,11 +172,11 @@ async def split_script_by_slides(
     total_chunks = len(chunks)
 
     # ── 각 청크를 담당 슬라이드에 배정
-    # 단조증가 제약: 이전 청크의 최대 슬라이드 번호 이상만 허용
-    chunk_assignments: list[int | None] = []   # None = 해당없음
+    chunk_assignments: list[int | None] = []
     prev_max_slide = 0
+    prev_slide_text = ""  # 이전 배치 마지막 슬라이드 텍스트 (컨텍스트용)
 
-    ASSIGN_BATCH = 5  # 한 번에 몇 청크씩 처리할지
+    ASSIGN_BATCH = 4  # 배치 크기 줄여서 정밀도 향상
     for batch_start in range(0, total_chunks, ASSIGN_BATCH):
         batch_chunks = chunks[batch_start: batch_start + ASSIGN_BATCH]
         batch_numbered = "\n\n".join([
@@ -174,11 +184,16 @@ async def split_script_by_slides(
             for j, c in enumerate(batch_chunks)
         ])
 
+        # 이전 배치 마지막 슬라이드 컨텍스트
+        context_line = ""
+        if prev_max_slide > 0 and prev_slide_text:
+            context_line = f"\n[직전 슬라이드 {prev_max_slide} 내용]: {prev_slide_text[:200]}"
+
         prompt = f"""당신은 의학 강의 대본과 슬라이드를 정밀 매핑하는 전문가입니다.
 
 강의: {lecture_info}
 총 슬라이드 수: {total_pages}
-현재까지 처리된 슬라이드 범위: 슬라이드 1 ~ {prev_max_slide} 은 이미 이전 청크에서 사용됨.
+현재까지 매핑 완료된 슬라이드: 1~{prev_max_slide}{context_line}
 
 [전체 슬라이드 목록]
 {full_slide_list}
@@ -187,18 +202,18 @@ async def split_script_by_slides(
 {batch_numbered}
 
 [배정 규칙 - 엄격히 준수]
-1. 각 청크가 어느 슬라이드를 설명하는지 판단하세요.
-2. 슬라이드 번호는 반드시 단조증가해야 합니다. (앞 청크 슬라이드 번호 <= 현재 청크)
-3. 이전에 사용된 슬라이드 1~{prev_max_slide}보다 이전 번호는 절대 사용 불가.
-4. 청크 내용이 슬라이드 내용과 전혀 관련 없으면 slide_no를 null로 하세요.
-5. 교수님이 슬라이드를 설명하지 않고 건너뛴 경우 해당 슬라이드 번호는 건너뜁니다 (결과에 포함 안 해도 됨).
-6. 여러 청크가 같은 슬라이드에 해당할 수 있습니다.
+1. 각 청크의 키워드/주제가 어느 슬라이드 내용과 일치하는지 정밀하게 판단하세요.
+2. 슬라이드 번호는 반드시 단조증가. 이전 번호({prev_max_slide})보다 작은 번호 절대 불가.
+3. 슬라이드 전환 신호: "다음 슬라이드", "이번엔", 새로운 주제어 등장, 이전 슬라이드 키워드 소멸.
+4. 애매하면 현재 슬라이드보다 +1 앞으로 당기는 것을 적극 고려하세요. (밀리는 것 방지)
+5. 청크가 슬라이드와 전혀 무관(잡담, 공지 등)하면 null.
+6. 건너뛴 슬라이드는 결과에 없어도 됨.
 
 반드시 아래 JSON만 출력하세요:
 {{
   "assignments": [
     {{"chunk": {batch_start + 1}, "slide_no": 3}},
-    {{"chunk": {batch_start + 2}, "slide_no": 3}},
+    {{"chunk": {batch_start + 2}, "slide_no": 4}},
     {{"chunk": {batch_start + 3}, "slide_no": null}}
   ]
 }}
@@ -218,6 +233,8 @@ async def split_script_by_slides(
                         sn = max(int(sn), prev_max_slide)  # 단조증가 강제
                         sn = min(sn, total_pages)
                         prev_max_slide = sn
+                        # 이전 슬라이드 텍스트 업데이트 (다음 배치 컨텍스트용)
+                        prev_slide_text = " ".join(slide_texts[sn - 1].split())[:200]
                     chunk_assignments.append(sn)
             else:
                 chunk_assignments.extend([None] * len(batch_chunks))
