@@ -14,6 +14,7 @@ from telegram.ext import (
 from config import TELEGRAM_BOT_TOKEN
 from src.ai.refiner import (
     split_script_by_slides,
+    review_mapping,
     refine_page_scripts,
     extract_emphasis,
     extract_slide_texts_from_pdf,
@@ -134,7 +135,7 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
         # 1단계: 분할
-        page_scripts, split_cost = await split_script_by_slides(slide_texts, raw_script, lecture_info)
+        page_scripts, chunks, chunk_assignments, split_cost = await split_script_by_slides(slide_texts, raw_script, lecture_info)
         skipped = sum(1 for s in page_scripts if s == "해당 없음")
         total_input += split_cost["input_tokens"]
         total_output += split_cost["output_tokens"]
@@ -142,8 +143,22 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"✅ 1/3 매핑 완료 (건너뛴 슬라이드: {skipped}개)\n"
-            f"2/3 대본 정제 중..."
+            f"✅ 1/4 매핑 완료 (건너뛴 슬라이드: {skipped}개)\n"
+            f"2/4 매핑 검토 중..."
+        )
+
+        # 2단계: 맵핑 검토
+        page_scripts, review_cost = await review_mapping(page_scripts, slide_texts, chunks, chunk_assignments, lecture_info)
+        skipped_after = sum(1 for s in page_scripts if s == "해당 없음")
+        total_input += review_cost["input_tokens"]
+        total_output += review_cost["output_tokens"]
+
+        await status_msg.edit_text(
+            f"⏳ 처리 중입니다...\n"
+            f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
+            f"✅ 1/4 매핑 완료\n"
+            f"✅ 2/4 검토 완료 (건너뛴 슬라이드: {skipped_after}개)\n"
+            f"3/4 대본 정제 중..."
         )
 
         # 2단계: 정제
@@ -154,9 +169,10 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"✅ 1/3 슬라이드별 분할 완료\n"
-            f"✅ 2/3 대본 정제 완료\n"
-            f"3/3 중요 내용 발췌 중..."
+            f"✅ 1/4 매핑 완료\n"
+            f"✅ 2/4 검토 완료\n"
+            f"✅ 3/4 대본 정제 완료\n"
+            f"4/4 중요 내용 발췌 중..."
         )
 
         # 3단계: 중요 내용

@@ -107,7 +107,13 @@ async def extract_slide_texts_from_pdf(pdf_path: str) -> list[str]:
         try:
             text = await _generate_with_image(
                 img_bytes,
-                "이 강의 슬라이드에 있는 모든 텍스트를 그대로 추출해주세요. 텍스트만 출력하고 다른 설명은 하지 마세요."
+                """이 강의 슬라이드를 분석해서 아래 두 가지를 출력하세요.
+
+[텍스트] 슬라이드에 있는 모든 텍스트를 그대로 추출
+[시각] 슬라이드의 핵심 시각적 특징을 한 줄로 요약
+(예: '위장 해부도, 파란 화살표가 LES 가리킴' / 'GERD 병태생리 플로우차트, 빨간 박스 강조' / '내시경 사진 6장, Grade A-D 분류' / '텍스트만 있는 슬라이드' / '타임라인 다이어그램')
+
+텍스트가 없는 이미지 슬라이드도 반드시 [시각] 설명을 작성하세요."""
             )
             texts.append(text)
         except Exception:
@@ -254,7 +260,127 @@ async def split_script_by_slides(
         else:
             page_scripts.append("해당 없음")
 
-    return page_scripts, calculate_cost(total_input, total_output)
+    return page_scripts, chunks, chunk_assignments, calculate_cost(total_input, total_output)
+
+
+async def review_mapping(
+    page_scripts: list[str],
+    slide_texts: list[str],
+    chunks: list[str],
+    chunk_assignments: list[int | None],
+    lecture_info: str,
+) -> tuple[list[str], dict]:
+    """
+    맵핑 검토: 이상한 슬라이드(내용이 너무 몰리거나, 앞뒤 슬라이드와 맞지 않는 경우)를 감지하고 재배정
+    """
+    total_pages = len(page_scripts)
+    total_input = 0
+    total_output = 0
+
+    # 문제 슬라이드 감지: 내용이 너무 많거나(>2000자), 앞뒤가 해당없음인데 혼자 내용이 많은 경우
+    problem_slides = []
+    for i, script in enumerate(page_scripts):
+        if script == "해당 없음":
+            continue
+        slide_no = i + 1
+        # 앞뒤 5개 슬라이드가 모두 해당없음인데 혼자 내용이 비정상적으로 많음
+        neighbors_empty = all(
+            page_scripts[j] == "해당 없음"
+            for j in range(max(0, i-3), min(total_pages, i+4))
+            if j != i
+        )
+        if len(script) > 1500 or neighbors_empty:
+            problem_slides.append(slide_no)
+
+    if not problem_slides:
+        return page_scripts, calculate_cost(total_input, total_output)
+
+    # 문제 슬라이드 주변 청크들을 재검토
+    # 해당 슬라이드에 배정된 청크 인덱스 찾기
+    for prob_slide in problem_slides[:5]:  # 최대 5개만 처리
+        assigned_chunks = [
+            (idx, chunks[idx]) for idx, sn in enumerate(chunk_assignments)
+            if sn == prob_slide
+        ]
+        if not assigned_chunks:
+            continue
+
+        # 주변 슬라이드 텍스트
+        start = max(0, prob_slide - 4)
+        end = min(total_pages, prob_slide + 3)
+        nearby_slides = "
+".join([
+            f"[슬라이드 {j+1}] {' '.join(slide_texts[j].split())[:300]}"
+            for j in range(start, end)
+        ])
+
+        chunks_text = "
+
+".join([
+            f"[청크 {idx+1}]
+{c}" for idx, c in assigned_chunks
+        ])
+
+        prompt = f"""당신은 의학 강의 대본과 슬라이드 매핑을 검토하는 전문가입니다.
+
+강의: {lecture_info}
+총 슬라이드 수: {total_pages}
+
+현재 슬라이드 {prob_slide}에 아래 청크들이 모두 배정되어 있는데, 일부는 잘못 배정된 것 같습니다.
+
+[슬라이드 {prob_slide} 주변 슬라이드 목록]
+{nearby_slides}
+
+[슬라이드 {prob_slide}에 현재 배정된 청크들]
+{chunks_text}
+
+[검토 규칙]
+1. 각 청크가 실제로 어느 슬라이드에 해당하는지 재판단하세요.
+2. 슬라이드 번호는 단조증가 유지 (슬라이드 {max(1, prob_slide-3)} ~ {min(total_pages, prob_slide+2)} 범위 내)
+3. 슬라이드와 전혀 무관하면 null
+
+반드시 아래 JSON만 출력하세요:
+{{
+  "reassignments": [
+    {{"chunk": 청크번호, "slide_no": 슬라이드번호}},
+    ...
+  ]
+}}
+"""
+        text, cost = await _generate(prompt)
+        total_input += cost["input_tokens"]
+        total_output += cost["output_tokens"]
+
+        try:
+            clean = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+            json_match = re.search(r"\{.*\}", clean, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group())
+                for item in data.get("reassignments", []):
+                    chunk_idx = int(item["chunk"]) - 1
+                    new_sn = item.get("slide_no")
+                    if 0 <= chunk_idx < len(chunk_assignments):
+                        if new_sn is not None:
+                            new_sn = max(1, min(int(new_sn), total_pages))
+                        chunk_assignments[chunk_idx] = new_sn
+        except Exception:
+            pass
+
+    # 재배정 후 슬라이드별로 다시 합치기
+    slide_chunks: dict[int, list[str]] = {i: [] for i in range(1, total_pages + 1)}
+    for idx, slide_no in enumerate(chunk_assignments):
+        if slide_no is not None and 1 <= slide_no <= total_pages:
+            slide_chunks[slide_no].append(chunks[idx])
+
+    reviewed_scripts = []
+    for i in range(1, total_pages + 1):
+        if slide_chunks[i]:
+            reviewed_scripts.append("
+".join(slide_chunks[i]))
+        else:
+            reviewed_scripts.append("해당 없음")
+
+    return reviewed_scripts, calculate_cost(total_input, total_output)
 
 
 async def refine_page_scripts(page_scripts: list[str], lecture_info: str) -> tuple[list[str], dict]:
