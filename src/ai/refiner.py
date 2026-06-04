@@ -274,7 +274,80 @@ async def split_script_by_slides(
         else:
             page_scripts.append("해당 없음")
 
+    # ── 누락 구간 복구: 맵핑된 내용을 합쳐서 원본과 비교, 빠진 구간 감지 후 삽입
+    page_scripts = _recover_missing_content(raw_script, page_scripts, slide_texts)
+
     return page_scripts, all_chunks, chunk_to_slide, calculate_cost(total_input, total_output)
+
+
+def _recover_missing_content(raw_script: str, page_scripts: list[str], slide_texts: list[str]) -> list[str]:
+    """
+    맵핑 후 원본 대본에서 누락된 구간을 감지하여 가장 적절한 슬라이드에 삽입.
+    문장 단위로 원본을 순회하며 정제본에 없는 구간을 찾아냄.
+    """
+    import difflib
+
+    # 정제본 전체 텍스트 (슬라이드 구분 없이)
+    all_mapped = " ".join([s for s in page_scripts if s != "해당 없음"])
+
+    # 원본을 문단 단위로 분할
+    paragraphs = [p.strip() for p in raw_script.split("\n\n") if p.strip()]
+
+    missing_paragraphs: list[tuple[int, str]] = []  # (원본 위치, 내용)
+
+    for i, para in enumerate(paragraphs):
+        # 문단의 핵심 키워드 추출 (20자 이상인 문장의 앞 30자)
+        key = para[:40].replace(" ", "")
+        mapped_flat = all_mapped.replace(" ", "")
+
+        # 정제본에 없으면 누락으로 판단
+        if len(para) > 50 and key not in mapped_flat:
+            missing_paragraphs.append((i, para))
+
+    if not missing_paragraphs:
+        return page_scripts
+
+    # 누락된 문단을 앞뒤 문단 기준으로 가장 가까운 슬라이드에 삽입
+    for para_idx, missing_para in missing_paragraphs:
+        # 앞 문단이 어느 슬라이드에 배정됐는지 찾기
+        best_slide = None
+        for look_back in range(1, min(5, para_idx + 1)):
+            prev_para = paragraphs[para_idx - look_back]
+            prev_key = prev_para[:40].replace(" ", "")
+            for slide_idx, script in enumerate(page_scripts):
+                if script != "해당 없음" and prev_key in script.replace(" ", ""):
+                    best_slide = slide_idx
+                    break
+            if best_slide is not None:
+                break
+
+        # 앞에서 못 찾으면 뒤 문단 기준으로
+        if best_slide is None:
+            for look_forward in range(1, min(5, len(paragraphs) - para_idx)):
+                next_para = paragraphs[para_idx + look_forward]
+                next_key = next_para[:40].replace(" ", "")
+                for slide_idx, script in enumerate(page_scripts):
+                    if script != "해당 없음" and next_key in script.replace(" ", ""):
+                        best_slide = slide_idx
+                        break
+                if best_slide is not None:
+                    break
+
+        # 그래도 못 찾으면 해당없음이 아닌 가장 가까운 슬라이드에 붙임
+        if best_slide is None:
+            for offset in range(1, len(page_scripts)):
+                for direction in [-1, 1]:
+                    idx = len(page_scripts) // 2 + offset * direction
+                    if 0 <= idx < len(page_scripts) and page_scripts[idx] != "해당 없음":
+                        best_slide = idx
+                        break
+                if best_slide is not None:
+                    break
+
+        if best_slide is not None:
+            page_scripts[best_slide] = page_scripts[best_slide] + "\n" + missing_para
+
+    return page_scripts
 
 
 async def review_mapping(
@@ -390,7 +463,9 @@ async def refine_page_scripts(page_scripts: list[str], lecture_info: str) -> tup
 3. 교수님 질문-학생 답변 대화 형식 유지
 4. 불필요한 미사여구 제거, 구어체는 반드시 유지
 5. 교수님 농담은 살리기
-6. 슬라이드 내용과 관련없는 교수님 사설, 개인적인 이야기, 주제 벗어난 잡담은 제거할 것 (단, 농담은 제외)
+6. 교수님의 비유, 개인 경험담, 사례 얘기는 의학 내용 이해를 돕는 설명이므로 반드시 살릴 것
+   제거해도 되는 것: 순수 행정공지(출석, 과제 제출), 수업 진행 안내("다음 넘어가겠습니다") 정도만
+   절대 제거하면 안 되는 것: 교수님 비유/예시/경험담/농담/임상 사례 → 이건 다 살릴 것
 7. 의학용어는 영어로 + 괄호 안에 한국어 번역 (예: smallpox(천연두))
 8. 절대 요약하지 말 것, 산문 형식 유지
 9. 강조/기억하라고 한 내용 반드시 살리기
