@@ -16,6 +16,7 @@ from src.ai.refiner import (
     split_script_by_slides,
     review_mapping,
     refine_page_scripts,
+    preprocess_script,
     extract_emphasis,
     extract_slide_texts_from_pdf,
     calculate_cost,
@@ -130,12 +131,23 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"1/3 대본 청크 단위 슬라이드 매핑 중...\n"
-            f"(건너뛴 슬라이드 감지 포함, 잠시만 기다려주세요)"
+            f"1/5 대본 의학용어 전처리 중..."
         )
 
-        # 1단계: 분할
-        page_scripts, chunks, chunk_assignments, split_cost = await split_script_by_slides(slide_texts, raw_script, lecture_info)
+        # 1단계: 대본 전처리 (음성인식 오류 교정)
+        corrected_script, preprocess_cost = await preprocess_script(raw_script, lecture_info, slide_texts)
+        total_input += preprocess_cost["input_tokens"]
+        total_output += preprocess_cost["output_tokens"]
+
+        await status_msg.edit_text(
+            f"⏳ 처리 중입니다...\n"
+            f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
+            f"✅ 1/5 의학용어 전처리 완료\n"
+            f"2/5 슬라이드 매핑 중..."
+        )
+
+        # 2단계: 맵핑 (교정된 대본으로)
+        page_scripts, chunks, chunk_assignments, split_cost = await split_script_by_slides(slide_texts, corrected_script, lecture_info)
         skipped = sum(1 for s in page_scripts if s == "해당 없음")
         total_input += split_cost["input_tokens"]
         total_output += split_cost["output_tokens"]
@@ -143,8 +155,9 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"✅ 1/4 매핑 완료 (건너뛴 슬라이드: {skipped}개)\n"
-            f"2/4 매핑 검토 중..."
+            f"✅ 1/5 의학용어 전처리 완료\n"
+            f"✅ 2/5 매핑 완료 (건너뛴 슬라이드: {skipped}개)\n"
+            f"3/5 매핑 검토 중..."
         )
 
         # 2단계: 맵핑 검토
@@ -156,9 +169,10 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"✅ 1/4 매핑 완료\n"
-            f"✅ 2/4 검토 완료 (건너뛴 슬라이드: {skipped_after}개)\n"
-            f"3/4 대본 정제 중..."
+            f"✅ 1/5 의학용어 전처리 완료\n"
+            f"✅ 2/5 매핑 완료\n"
+            f"✅ 3/5 검토 완료 (건너뛴 슬라이드: {skipped_after}개)\n"
+            f"4/5 대본 정제 중..."
         )
 
         # 2단계: 정제
@@ -169,10 +183,11 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"✅ 1/4 매핑 완료\n"
-            f"✅ 2/4 검토 완료\n"
-            f"✅ 3/4 대본 정제 완료\n"
-            f"4/4 중요 내용 발췌 중..."
+            f"✅ 1/5 의학용어 전처리 완료\n"
+            f"✅ 2/5 매핑 완료\n"
+            f"✅ 3/5 검토 완료\n"
+            f"✅ 4/5 대본 정제 완료\n"
+            f"5/5 중요 내용 발췌 중..."
         )
 
         # 3단계: 중요 내용
