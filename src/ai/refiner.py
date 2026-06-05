@@ -28,20 +28,22 @@ def calculate_cost(input_tokens: int, output_tokens: int) -> dict:
 async def _generate(prompt: str, model: str = "gemini-2.5-flash", max_retries: int = 10) -> tuple[str, dict]:
     for attempt in range(max_retries):
         try:
-            response = await client.aio.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.0),
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(temperature=0.0),
+                ),
+                timeout=120.0  # 2분 타임아웃
             )
             usage = response.usage_metadata
             cost = calculate_cost(usage.prompt_token_count, usage.candidates_token_count)
             return response.text, cost
         except Exception as e:
             err_str = str(e)
-            is_retryable = any(k in err_str for k in ["503", "504", "UNAVAILABLE", "CANCELLED", "429"]) or \
-                           any(k in err_str.lower() for k in ["overloaded", "high demand"])
+            is_retryable = isinstance(e, asyncio.TimeoutError) or                            any(k in err_str for k in ["503", "504", "UNAVAILABLE", "CANCELLED", "429"]) or                            any(k in err_str.lower() for k in ["overloaded", "high demand"])
             if is_retryable and attempt < max_retries - 1:
-                base_wait = min(2 ** attempt, 60)
+                base_wait = min(2 ** attempt, 30)
                 jitter = random.uniform(0, base_wait * 0.3)
                 await asyncio.sleep(base_wait + jitter)
             else:
@@ -51,20 +53,22 @@ async def _generate(prompt: str, model: str = "gemini-2.5-flash", max_retries: i
 async def _generate_with_image(img_bytes: bytes, prompt: str, max_retries: int = 10) -> str:
     for attempt in range(max_retries):
         try:
-            response = await client.aio.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=[
-                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
-                    prompt,
-                ],
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model="gemini-2.5-flash-lite",
+                    contents=[
+                        types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                        prompt,
+                    ],
+                ),
+                timeout=60.0  # 60초 타임아웃
             )
             return response.text.strip()
         except Exception as e:
             err_str = str(e)
-            is_retryable = any(k in err_str for k in ["503", "504", "UNAVAILABLE", "CANCELLED", "429"]) or \
-                           any(k in err_str.lower() for k in ["overloaded", "high demand"])
+            is_retryable = isinstance(e, asyncio.TimeoutError) or                            any(k in err_str for k in ["503", "504", "UNAVAILABLE", "CANCELLED", "429"]) or                            any(k in err_str.lower() for k in ["overloaded", "high demand"])
             if is_retryable and attempt < max_retries - 1:
-                base_wait = min(2 ** attempt, 60)
+                base_wait = min(2 ** attempt, 30)
                 jitter = random.uniform(0, base_wait * 0.3)
                 await asyncio.sleep(base_wait + jitter)
             else:

@@ -1,4 +1,5 @@
 import os
+import asyncio
 import tempfile
 
 from telegram import Update, Document
@@ -134,6 +135,11 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"1/5 대본 의학용어 전처리 중..."
         )
 
+        # 작업 취소 가능하도록 현재 task 저장
+        current_task = asyncio.current_task()
+        if user_id in user_sessions:
+            user_sessions[user_id]["current_task"] = current_task
+
         # 1단계: 대본 전처리 (음성인식 오류 교정)
         corrected_script, preprocess_cost = await preprocess_script(raw_script, lecture_info, slide_texts)
         total_input += preprocess_cost["input_tokens"]
@@ -238,10 +244,14 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in user_sessions:
         session = user_sessions[user_id]
+        # 실행 중인 AI 작업 강제 취소
+        task = session.get("current_task")
+        if task and not task.done():
+            task.cancel()
         if session.get("pdf_path") and os.path.exists(session["pdf_path"]):
             os.remove(session["pdf_path"])
         del user_sessions[user_id]
-    await update.message.reply_text("취소되었습니다. /start로 다시 시작할 수 있습니다.")
+    await update.message.reply_text("⛔ 작업이 취소되었습니다. /start로 다시 시작할 수 있습니다.")
     return ConversationHandler.END
 
 
