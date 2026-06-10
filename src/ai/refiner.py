@@ -25,7 +25,11 @@ def calculate_cost(input_tokens: int, output_tokens: int) -> dict:
     }
 
 
+<<<<<<< HEAD
 async def _generate(prompt: str, model: str = "gemini-2.5-flash", max_retries: int = 15) -> tuple[str, dict]:
+=======
+async def _generate(prompt: str, model: str = "gemini-2.5-flash", max_retries: int = 10) -> tuple[str, dict]:
+>>>>>>> 51fe1b03bef196a043633ac37a9159c217c69490
     for attempt in range(max_retries):
         try:
             response = await asyncio.wait_for(
@@ -43,14 +47,22 @@ async def _generate(prompt: str, model: str = "gemini-2.5-flash", max_retries: i
             err_str = str(e)
             is_retryable = isinstance(e, asyncio.TimeoutError) or                            any(k in err_str for k in ["503", "504", "UNAVAILABLE", "CANCELLED", "429"]) or                            any(k in err_str.lower() for k in ["overloaded", "high demand"])
             if is_retryable and attempt < max_retries - 1:
+<<<<<<< HEAD
                 base_wait = min(2 ** attempt, 60)
+=======
+                base_wait = min(2 ** attempt, 30)
+>>>>>>> 51fe1b03bef196a043633ac37a9159c217c69490
                 jitter = random.uniform(0, base_wait * 0.3)
                 await asyncio.sleep(base_wait + jitter)
             else:
                 raise
 
 
+<<<<<<< HEAD
 async def _generate_with_image(img_bytes: bytes, prompt: str, max_retries: int = 15) -> str:
+=======
+async def _generate_with_image(img_bytes: bytes, prompt: str, max_retries: int = 10) -> str:
+>>>>>>> 51fe1b03bef196a043633ac37a9159c217c69490
     for attempt in range(max_retries):
         try:
             response = await asyncio.wait_for(
@@ -68,7 +80,7 @@ async def _generate_with_image(img_bytes: bytes, prompt: str, max_retries: int =
             err_str = str(e)
             is_retryable = isinstance(e, asyncio.TimeoutError) or                            any(k in err_str for k in ["503", "504", "UNAVAILABLE", "CANCELLED", "429"]) or                            any(k in err_str.lower() for k in ["overloaded", "high demand"])
             if is_retryable and attempt < max_retries - 1:
-                base_wait = min(2 ** attempt, 60)
+                base_wait = min(2 ** attempt, 30)
                 jitter = random.uniform(0, base_wait * 0.3)
                 await asyncio.sleep(base_wait + jitter)
             else:
@@ -242,7 +254,11 @@ async def split_script_by_slides(
   ]
 }}
 """
+<<<<<<< HEAD
         text, cost = await _generate(prompt, model="gemini-2.5-flash-lite")
+=======
+        text, cost = await _generate(prompt, model="gemini-2.5-flash")
+>>>>>>> 51fe1b03bef196a043633ac37a9159c217c69490
         total_input += cost["input_tokens"]
         total_output += cost["output_tokens"]
 
@@ -420,7 +436,11 @@ async def review_mapping(
   ]
 }}
 """
+<<<<<<< HEAD
         text, cost = await _generate(prompt, model="gemini-2.5-flash-lite")
+=======
+        text, cost = await _generate(prompt, model="gemini-2.5-flash")
+>>>>>>> 51fe1b03bef196a043633ac37a9159c217c69490
         total_input += cost["input_tokens"]
         total_output += cost["output_tokens"]
 
