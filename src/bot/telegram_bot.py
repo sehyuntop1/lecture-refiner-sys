@@ -160,30 +160,9 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-<<<<<<< HEAD
             f"✅ 1/4 의학용어 전처리 완료\n"
             f"✅ 2/4 매핑 완료 (건너뛴 슬라이드: {skipped}개)\n"
             f"3/4 대본 정제 중..."
-=======
-            f"✅ 1/5 의학용어 전처리 완료\n"
-            f"✅ 2/5 매핑 완료 (건너뛴 슬라이드: {skipped}개)\n"
-            f"3/5 매핑 검토 중..."
-        )
-
-        # 2단계: 맵핑 검토
-        page_scripts, review_cost = await review_mapping(page_scripts, slide_texts, chunks, chunk_assignments, lecture_info)
-        skipped_after = sum(1 for s in page_scripts if s == "해당 없음")
-        total_input += review_cost["input_tokens"]
-        total_output += review_cost["output_tokens"]
-
-        await status_msg.edit_text(
-            f"⏳ 처리 중입니다...\n"
-            f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"✅ 1/5 의학용어 전처리 완료\n"
-            f"✅ 2/5 매핑 완료\n"
-            f"✅ 3/5 검토 완료 (건너뛴 슬라이드: {skipped_after}개)\n"
-            f"4/5 대본 정제 중..."
->>>>>>> 51fe1b03bef196a043633ac37a9159c217c69490
         )
 
         # 2단계: 정제
@@ -194,18 +173,10 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-<<<<<<< HEAD
             f"✅ 1/4 의학용어 전처리 완료\n"
             f"✅ 2/4 매핑 완료\n"
             f"✅ 3/4 대본 정제 완료\n"
             f"4/4 중요 내용 발췌 중..."
-=======
-            f"✅ 1/5 의학용어 전처리 완료\n"
-            f"✅ 2/5 매핑 완료\n"
-            f"✅ 3/5 검토 완료\n"
-            f"✅ 4/5 대본 정제 완료\n"
-            f"5/5 중요 내용 발췌 중..."
->>>>>>> 51fe1b03bef196a043633ac37a9159c217c69490
         )
 
         # 3단계: 중요 내용
