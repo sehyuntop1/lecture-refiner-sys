@@ -1,4 +1,5 @@
 import os
+import asyncio
 import tempfile
 
 from telegram import Update, Document
@@ -14,8 +15,8 @@ from telegram.ext import (
 from config import TELEGRAM_BOT_TOKEN
 from src.ai.refiner import (
     split_script_by_slides,
-    review_mapping,
     refine_page_scripts,
+    preprocess_script,
     extract_emphasis,
     extract_slide_texts_from_pdf,
     calculate_cost,
@@ -130,12 +131,28 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"1/3 대본 청크 단위 슬라이드 매핑 중...\n"
-            f"(건너뛴 슬라이드 감지 포함, 잠시만 기다려주세요)"
+            f"1/5 대본 의학용어 전처리 중..."
         )
 
-        # 1단계: 분할
-        page_scripts, chunks, chunk_assignments, split_cost = await split_script_by_slides(slide_texts, raw_script, lecture_info)
+        # 작업 취소 가능하도록 현재 task 저장
+        current_task = asyncio.current_task()
+        if user_id in user_sessions:
+            user_sessions[user_id]["current_task"] = current_task
+
+        # 1단계: 대본 전처리 (음성인식 오류 교정)
+        corrected_script, preprocess_cost = await preprocess_script(raw_script, lecture_info, slide_texts)
+        total_input += preprocess_cost["input_tokens"]
+        total_output += preprocess_cost["output_tokens"]
+
+        await status_msg.edit_text(
+            f"⏳ 처리 중입니다...\n"
+            f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
+            f"✅ 1/5 의학용어 전처리 완료\n"
+            f"2/5 슬라이드 매핑 중..."
+        )
+
+        # 2단계: 맵핑 (교정된 대본으로)
+        page_scripts, chunks, chunk_assignments, split_cost = await split_script_by_slides(slide_texts, corrected_script, lecture_info)
         skipped = sum(1 for s in page_scripts if s == "해당 없음")
         total_input += split_cost["input_tokens"]
         total_output += split_cost["output_tokens"]
@@ -143,21 +160,8 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"✅ 1/4 매핑 완료 (건너뛴 슬라이드: {skipped}개)\n"
-            f"2/4 매핑 검토 중..."
-        )
-
-        # 2단계: 맵핑 검토
-        page_scripts, review_cost = await review_mapping(page_scripts, slide_texts, chunks, chunk_assignments, lecture_info)
-        skipped_after = sum(1 for s in page_scripts if s == "해당 없음")
-        total_input += review_cost["input_tokens"]
-        total_output += review_cost["output_tokens"]
-
-        await status_msg.edit_text(
-            f"⏳ 처리 중입니다...\n"
-            f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"✅ 1/4 매핑 완료\n"
-            f"✅ 2/4 검토 완료 (건너뛴 슬라이드: {skipped_after}개)\n"
+            f"✅ 1/4 의학용어 전처리 완료\n"
+            f"✅ 2/4 매핑 완료 (건너뛴 슬라이드: {skipped}개)\n"
             f"3/4 대본 정제 중..."
         )
 
@@ -169,8 +173,8 @@ async def done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"⏳ 처리 중입니다...\n"
             f"✅ 슬라이드 {total_pages}페이지 추출 완료\n"
-            f"✅ 1/4 매핑 완료\n"
-            f"✅ 2/4 검토 완료\n"
+            f"✅ 1/4 의학용어 전처리 완료\n"
+            f"✅ 2/4 매핑 완료\n"
             f"✅ 3/4 대본 정제 완료\n"
             f"4/4 중요 내용 발췌 중..."
         )
@@ -223,10 +227,14 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in user_sessions:
         session = user_sessions[user_id]
+        # 실행 중인 AI 작업 강제 취소
+        task = session.get("current_task")
+        if task and not task.done():
+            task.cancel()
         if session.get("pdf_path") and os.path.exists(session["pdf_path"]):
             os.remove(session["pdf_path"])
         del user_sessions[user_id]
-    await update.message.reply_text("취소되었습니다. /start로 다시 시작할 수 있습니다.")
+    await update.message.reply_text("⛔ 작업이 취소되었습니다. /start로 다시 시작할 수 있습니다.")
     return ConversationHandler.END
 
 
