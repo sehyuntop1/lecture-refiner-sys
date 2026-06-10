@@ -2,6 +2,7 @@
 import json
 import re
 import asyncio
+import random
 from google import genai
 from google.genai import types
 from config import GEMINI_API_KEY
@@ -24,243 +25,333 @@ def calculate_cost(input_tokens: int, output_tokens: int) -> dict:
     }
 
 
-async def _generate(prompt: str, max_retries: int = 10) -> tuple[str, dict]:
-    import random
+async def _generate(prompt: str, model: str = "gemini-2.5-flash", max_retries: int = 15) -> tuple[str, dict]:
     for attempt in range(max_retries):
         try:
-            response = await client.aio.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.0),
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(temperature=0.0),
+                ),
+                timeout=120.0  # 2분 타임아웃
             )
             usage = response.usage_metadata
             cost = calculate_cost(usage.prompt_token_count, usage.candidates_token_count)
             return response.text, cost
-
         except Exception as e:
             err_str = str(e)
-            is_retryable = (
-                "503" in err_str or
-                "504" in err_str or
-                "UNAVAILABLE" in err_str or
-                "CANCELLED" in err_str or
-                "429" in err_str or
-                "overloaded" in err_str.lower() or
-                "high demand" in err_str.lower()
-            )
+            is_retryable = isinstance(e, asyncio.TimeoutError) or                            any(k in err_str for k in ["503", "504", "UNAVAILABLE", "CANCELLED", "429"]) or                            any(k in err_str.lower() for k in ["overloaded", "high demand"])
             if is_retryable and attempt < max_retries - 1:
-                # exponential backoff + jitter (최대 60초)
                 base_wait = min(2 ** attempt, 60)
                 jitter = random.uniform(0, base_wait * 0.3)
-                wait = base_wait + jitter
-                await asyncio.sleep(wait)
-                continue
+                await asyncio.sleep(base_wait + jitter)
             else:
                 raise
 
 
-async def _generate_with_image(img_bytes: bytes, prompt: str, max_retries: int = 10) -> str:
-    import random
+async def _generate_with_image(img_bytes: bytes, prompt: str, max_retries: int = 15) -> str:
     for attempt in range(max_retries):
         try:
-            response = await client.aio.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=[
-                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
-                    prompt,
-                ],
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model="gemini-2.5-flash-lite",
+                    contents=[
+                        types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                        prompt,
+                    ],
+                ),
+                timeout=60.0  # 60초 타임아웃
             )
             return response.text.strip()
-
         except Exception as e:
             err_str = str(e)
-            is_retryable = (
-                "503" in err_str or
-                "504" in err_str or
-                "UNAVAILABLE" in err_str or
-                "CANCELLED" in err_str or
-                "429" in err_str or
-                "overloaded" in err_str.lower() or
-                "high demand" in err_str.lower()
-            )
+            is_retryable = isinstance(e, asyncio.TimeoutError) or                            any(k in err_str for k in ["503", "504", "UNAVAILABLE", "CANCELLED", "429"]) or                            any(k in err_str.lower() for k in ["overloaded", "high demand"])
             if is_retryable and attempt < max_retries - 1:
                 base_wait = min(2 ** attempt, 60)
                 jitter = random.uniform(0, base_wait * 0.3)
-                wait = base_wait + jitter
-                await asyncio.sleep(wait)
-                continue
+                await asyncio.sleep(base_wait + jitter)
             else:
                 raise
 
 
 async def extract_slide_texts_from_pdf(pdf_path: str) -> list[str]:
+    """슬라이드별 텍스트 + 시각적 특징 추출"""
     import fitz
 
     doc = fitz.open(pdf_path)
     texts = []
 
     for i, page in enumerate(doc):
-        mat = fitz.Matrix(2, 2)
+        mat = fitz.Matrix(1.5, 1.5)
         pix = page.get_pixmap(matrix=mat)
         img_bytes = pix.tobytes("png")
 
         try:
             text = await _generate_with_image(
                 img_bytes,
-                """이 강의 슬라이드를 분석해서 아래 두 가지를 출력하세요.
+                """이 강의 슬라이드를 분석하세요.
 
-[텍스트] 슬라이드에 있는 모든 텍스트를 그대로 추출
-[시각] 슬라이드의 핵심 시각적 특징을 한 줄로 요약
-(예: '위장 해부도, 파란 화살표가 LES 가리킴' / 'GERD 병태생리 플로우차트, 빨간 박스 강조' / '내시경 사진 6장, Grade A-D 분류' / '텍스트만 있는 슬라이드' / '타임라인 다이어그램')
+[텍스트] 슬라이드의 모든 텍스트를 빠짐없이 추출
+[시각] 슬라이드의 핵심 시각적 특징을 한 줄 요약 (이미지/다이어그램/표/사진 종류 및 주요 내용)
+[유형] 아래 중 하나로 분류:
+  - COVER: 표지 슬라이드
+  - SECTION: 섹션 구분 슬라이드 (짧은 제목만 있는 구분용)
+  - OBJECTIVES: 학습목표 슬라이드
+  - CONTENT: 실제 강의 내용 슬라이드
+  - IMAGE_ONLY: 이미지/사진만 있는 슬라이드
+  - TABLE: 표/스코어링 시스템 슬라이드
+  - SUMMARY: 요약/정리 슬라이드
 
-텍스트가 없는 이미지 슬라이드도 반드시 [시각] 설명을 작성하세요."""
+텍스트가 없는 슬라이드도 반드시 [시각]과 [유형]을 작성하세요."""
             )
             texts.append(text)
         except Exception:
-            texts.append(f"(페이지 {i+1} 추출 실패)")
+            texts.append(f"[텍스트] (페이지 {i+1} 추출 실패)\n[시각] 추출 실패\n[유형] CONTENT")
 
     doc.close()
     return texts
 
 
-def _split_script_into_sentences(raw_script: str) -> list[str]:
-    """대본을 문장 단위로 나누되, 교수/학생 발화 기준으로 분리"""
-    # 줄바꿈 기준으로 우선 분리한 뒤 너무 짧은 줄은 앞에 합침
-    lines = [l.strip() for l in raw_script.split("\n") if l.strip()]
-    merged = []
-    buf = ""
-    for line in lines:
-        if len(line) < 15 and buf:
-            buf += " " + line
-        else:
-            if buf:
-                merged.append(buf)
-            buf = line
-    if buf:
-        merged.append(buf)
-    return merged
+def _parse_slide_type(slide_text: str) -> str:
+    """슬라이드 유형 파싱"""
+    match = re.search(r'\[유형\]\s*(\w+)', slide_text)
+    if match:
+        return match.group(1).upper()
+    return "CONTENT"
+
+
+def _is_mappable_slide(slide_text: str) -> bool:
+    """맵핑 대상 슬라이드인지 판단 (표지/섹션구분/학습목표 제외)"""
+    slide_type = _parse_slide_type(slide_text)
+    return slide_type not in ("COVER", "SECTION", "OBJECTIVES")
 
 
 async def split_script_by_slides(
     slide_texts: list[str], raw_script: str, lecture_info: str
-) -> tuple[list[str], dict]:
+) -> tuple[list[str], list[str], list[int | None], dict]:
     """
-    개선된 맵핑 전략:
-    1. 전체 슬라이드 텍스트를 온전히 제공 (앞 100자 자르기 제거)
-    2. CHUNK 단위로 대본을 나눠서 각 청크마다 해당 슬라이드 구간 지정
-    3. 슬라이드 순서 단조증가 제약을 강제
-    4. 건너뛴 슬라이드 명시 요청 강화
+    완전히 새로운 맵핑 전략:
+    1. 슬라이드를 유형별로 분류 (표지/섹션구분 → 맵핑 제외)
+    2. 대본 전체를 한 번에 AI에게 넘겨서 슬라이드별 대본 구간을 통째로 분할
+    3. 대본이 너무 길면 절반씩 나눠서 처리 후 합침
+    4. 검증 및 재시도 로직
     """
     total_pages = len(slide_texts)
     total_input = 0
     total_output = 0
 
-    # ── 슬라이드 목록 (500자로 확대, 줄바꿈 제거)
-    slide_list_lines = []
+    # ── 슬라이드 분류
+    mappable_slides = []  # (원본 인덱스, 슬라이드 내용)
     for i, text in enumerate(slide_texts):
-        one_line = " ".join(text.split())[:500]
-        slide_list_lines.append(f"[슬라이드 {i+1}] {one_line}")
+        if _is_mappable_slide(text):
+            mappable_slides.append((i + 1, text))  # 1-indexed
+
+    # ── 슬라이드 목록 구성 (맵핑 가능한 슬라이드만, 전체 텍스트)
+    slide_list_lines = []
+    for slide_no, text in mappable_slides:
+        # [텍스트], [시각] 파싱
+        text_match = re.search(r'\[텍스트\](.*?)(?=\[시각\]|\[유형\]|$)', text, re.DOTALL)
+        visual_match = re.search(r'\[시각\](.*?)(?=\[유형\]|$)', text, re.DOTALL)
+        slide_type = _parse_slide_type(text)
+
+        extracted_text = text_match.group(1).strip()[:400] if text_match else " ".join(text.split())[:400]
+        visual_desc = visual_match.group(1).strip()[:100] if visual_match else ""
+
+        entry = f"[슬라이드 {slide_no}] ({slide_type})"
+        if extracted_text:
+            entry += f" 텍스트: {extracted_text}"
+        if visual_desc:
+            entry += f" | 시각: {visual_desc}"
+        slide_list_lines.append(entry)
+
     full_slide_list = "\n".join(slide_list_lines)
+    mappable_slide_numbers = [s[0] for s in mappable_slides]
 
-    # ── 대본을 ~300자 청크로 분할 (슬라이드 전환점 정밀 감지)
-    sentences = _split_script_into_sentences(raw_script)
-    chunks: list[str] = []
-    current_chunk = ""
-    for sent in sentences:
-        if len(current_chunk) + len(sent) > 300 and current_chunk:
-            chunks.append(current_chunk.strip())
-            current_chunk = sent
-        else:
-            current_chunk = (current_chunk + "\n" + sent).strip()
-    if current_chunk:
-        chunks.append(current_chunk.strip())
+    # ── 대본이 너무 길면 절반으로 나눠서 처리
+    script_len = len(raw_script)
+    SCRIPT_LIMIT = 15000  # 15000자 이상이면 분할
 
-    total_chunks = len(chunks)
+    if script_len <= SCRIPT_LIMIT:
+        script_parts = [raw_script]
+        slide_splits = [mappable_slide_numbers]
+    else:
+        # 절반 지점에서 슬라이드 목록도 절반 분할
+        mid_script = script_len // 2
+        # 줄바꿈 기준으로 자르기
+        newline_pos = raw_script.rfind('\n', 0, mid_script)
+        if newline_pos == -1:
+            newline_pos = mid_script
+        part1 = raw_script[:newline_pos]
+        part2 = raw_script[newline_pos:]
 
-    # ── 각 청크를 담당 슬라이드에 배정
-    chunk_assignments: list[int | None] = []
-    prev_max_slide = 0
-    prev_slide_text = ""  # 이전 배치 마지막 슬라이드 텍스트 (컨텍스트용)
+        mid_slide = len(mappable_slide_numbers) // 2
+        script_parts = [part1, part2]
+        slide_splits = [mappable_slide_numbers[:mid_slide], mappable_slide_numbers[mid_slide:]]
 
-    ASSIGN_BATCH = 4  # 배치 크기 줄여서 정밀도 향상
-    for batch_start in range(0, total_chunks, ASSIGN_BATCH):
-        batch_chunks = chunks[batch_start: batch_start + ASSIGN_BATCH]
-        batch_numbered = "\n\n".join([
-            f"[청크 {batch_start + j + 1}]\n{c}"
-            for j, c in enumerate(batch_chunks)
+    # ── 파트별 맵핑 수행
+    all_assignments: dict[str, int | None] = {}  # chunk_key -> slide_no
+    all_chunks: list[str] = []
+    chunk_to_slide: list[int | None] = []
+
+    for part_idx, (script_part, slide_nums) in enumerate(zip(script_parts, slide_splits)):
+        if not slide_nums:
+            continue
+
+        # 이 파트에 해당하는 슬라이드 목록
+        part_slide_list = "\n".join([
+            l for l in slide_list_lines
+            if any(f"[슬라이드 {n}]" in l for n in slide_nums)
         ])
 
-        # 이전 배치 마지막 슬라이드 컨텍스트
-        context_line = ""
-        if prev_max_slide > 0 and prev_slide_text:
-            context_line = f"\n[직전 슬라이드 {prev_max_slide} 내용]: {prev_slide_text[:200]}"
-
-        prompt = f"""당신은 의학 강의 대본과 슬라이드를 정밀 매핑하는 전문가입니다.
+        prompt = f"""당신은 의학 강의 대본과 슬라이드를 정밀 매핑하는 최고 전문가입니다.
 
 강의: {lecture_info}
 총 슬라이드 수: {total_pages}
-현재까지 매핑 완료된 슬라이드: 1~{prev_max_slide}{context_line}
+이번 파트에서 처리할 슬라이드: {slide_nums}
 
-[전체 슬라이드 목록]
-{full_slide_list}
+[슬라이드 목록]
+{part_slide_list}
 
-[이번에 배정할 대본 청크들]
-{batch_numbered}
+[강의 대본]
+{script_part}
 
-[배정 규칙 - 엄격히 준수]
-1. 각 청크의 키워드/주제가 어느 슬라이드 내용과 일치하는지 정밀하게 판단하세요.
-2. 슬라이드 번호는 반드시 단조증가. 이전 번호({prev_max_slide})보다 작은 번호 절대 불가.
-3. 슬라이드 전환 신호: "다음 슬라이드", "이번엔", 새로운 주제어 등장, 이전 슬라이드 키워드 소멸.
-4. 애매하면 현재 슬라이드보다 +1 앞으로 당기는 것을 적극 고려하세요. (밀리는 것 방지)
-5. 청크가 슬라이드와 전혀 무관(잡담, 공지 등)하면 null.
-6. 건너뛴 슬라이드는 결과에 없어도 됨.
+[작업 지시]
+위 대본을 읽고, 각 슬라이드에 해당하는 대본 구간을 정확히 분할하세요.
 
-반드시 아래 JSON만 출력하세요:
+[핵심 규칙]
+1. 대본의 키워드/주제어가 슬라이드 텍스트와 일치하는 부분을 찾아 배정하세요.
+2. 슬라이드 번호는 반드시 오름차순이어야 합니다.
+3. 교수님이 건너뛴 슬라이드는 배정하지 않아도 됩니다.
+4. 한 슬라이드에 여러 문단이 배정될 수 있고, 여러 슬라이드에 걸쳐 설명하는 경우도 있습니다.
+5. 표지/섹션구분 슬라이드는 목록에 없으므로 신경 쓰지 마세요.
+6. 대본 내용을 절대 생략하거나 요약하지 말고, 원문 그대로 배정하세요.
+7. 슬라이드와 무관한 잡담/공지/사설은 배정하지 않아도 됩니다.
+
+반드시 아래 JSON 형식으로만 출력하세요. 대본 내용은 원문 그대로 넣으세요:
 {{
-  "assignments": [
-    {{"chunk": {batch_start + 1}, "slide_no": 3}},
-    {{"chunk": {batch_start + 2}, "slide_no": 4}},
-    {{"chunk": {batch_start + 3}, "slide_no": null}}
+  "mappings": [
+    {{
+      "slide_no": 5,
+      "script": "해당 슬라이드의 대본 원문 전체"
+    }},
+    {{
+      "slide_no": 7,
+      "script": "해당 슬라이드의 대본 원문 전체"
+    }}
   ]
 }}
 """
-        text, cost = await _generate(prompt)
+        text, cost = await _generate(prompt, model="gemini-2.5-flash-lite")
         total_input += cost["input_tokens"]
         total_output += cost["output_tokens"]
 
         try:
             clean = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
-            json_match = re.search(r"\{.*\}", clean, re.DOTALL)
+            json_match = re.search(r'\{.*\}', clean, re.DOTALL)
             if json_match:
                 data = json.loads(json_match.group())
-                for item in data.get("assignments", []):
+                for item in data.get("mappings", []):
                     sn = item.get("slide_no")
-                    if sn is not None:
-                        sn = max(int(sn), prev_max_slide)  # 단조증가 강제
-                        sn = min(sn, total_pages)
-                        prev_max_slide = sn
-                        # 이전 슬라이드 텍스트 업데이트 (다음 배치 컨텍스트용)
-                        prev_slide_text = " ".join(slide_texts[sn - 1].split())[:200]
-                    chunk_assignments.append(sn)
-            else:
-                chunk_assignments.extend([None] * len(batch_chunks))
+                    sc = item.get("script", "")
+                    if sn and sc and sn in slide_nums:
+                        chunk_key = f"slide_{sn}"
+                        all_assignments[chunk_key] = sn
+                        all_chunks.append(sc)
+                        chunk_to_slide.append(sn)
         except Exception:
-            chunk_assignments.extend([None] * len(batch_chunks))
+            pass
 
-    # ── 슬라이드별로 청크 합치기
-    slide_chunks: dict[int, list[str]] = {i: [] for i in range(1, total_pages + 1)}
-    for idx, slide_no in enumerate(chunk_assignments):
-        if slide_no is not None and 1 <= slide_no <= total_pages:
-            slide_chunks[slide_no].append(chunks[idx])
+    # ── 슬라이드별 대본 합치기
+    slide_scripts: dict[int, str] = {}
+    for chunk_idx, slide_no in enumerate(chunk_to_slide):
+        if slide_no is not None:
+            if slide_no in slide_scripts:
+                slide_scripts[slide_no] += "\n" + all_chunks[chunk_idx]
+            else:
+                slide_scripts[slide_no] = all_chunks[chunk_idx]
 
     page_scripts = []
     for i in range(1, total_pages + 1):
-        if slide_chunks[i]:
-            page_scripts.append("\n".join(slide_chunks[i]))
+        if i in slide_scripts:
+            page_scripts.append(slide_scripts[i])
         else:
             page_scripts.append("해당 없음")
 
-    return page_scripts, chunks, chunk_assignments, calculate_cost(total_input, total_output)
+    # ── 누락 구간 복구: 맵핑된 내용을 합쳐서 원본과 비교, 빠진 구간 감지 후 삽입
+    page_scripts = _recover_missing_content(raw_script, page_scripts, slide_texts)
+
+    return page_scripts, all_chunks, chunk_to_slide, calculate_cost(total_input, total_output)
+
+
+def _recover_missing_content(raw_script: str, page_scripts: list[str], slide_texts: list[str]) -> list[str]:
+    """
+    맵핑 후 원본 대본에서 누락된 구간을 감지하여 가장 적절한 슬라이드에 삽입.
+    문장 단위로 원본을 순회하며 정제본에 없는 구간을 찾아냄.
+    """
+    import difflib
+
+    # 정제본 전체 텍스트 (슬라이드 구분 없이)
+    all_mapped = " ".join([s for s in page_scripts if s != "해당 없음"])
+
+    # 원본을 문단 단위로 분할
+    paragraphs = [p.strip() for p in raw_script.split("\n\n") if p.strip()]
+
+    missing_paragraphs: list[tuple[int, str]] = []  # (원본 위치, 내용)
+
+    for i, para in enumerate(paragraphs):
+        # 문단의 핵심 키워드 추출 (20자 이상인 문장의 앞 30자)
+        key = para[:40].replace(" ", "")
+        mapped_flat = all_mapped.replace(" ", "")
+
+        # 정제본에 없으면 누락으로 판단
+        if len(para) > 50 and key not in mapped_flat:
+            missing_paragraphs.append((i, para))
+
+    if not missing_paragraphs:
+        return page_scripts
+
+    # 누락된 문단을 앞뒤 문단 기준으로 가장 가까운 슬라이드에 삽입
+    for para_idx, missing_para in missing_paragraphs:
+        # 앞 문단이 어느 슬라이드에 배정됐는지 찾기
+        best_slide = None
+        for look_back in range(1, min(5, para_idx + 1)):
+            prev_para = paragraphs[para_idx - look_back]
+            prev_key = prev_para[:40].replace(" ", "")
+            for slide_idx, script in enumerate(page_scripts):
+                if script != "해당 없음" and prev_key in script.replace(" ", ""):
+                    best_slide = slide_idx
+                    break
+            if best_slide is not None:
+                break
+
+        # 앞에서 못 찾으면 뒤 문단 기준으로
+        if best_slide is None:
+            for look_forward in range(1, min(5, len(paragraphs) - para_idx)):
+                next_para = paragraphs[para_idx + look_forward]
+                next_key = next_para[:40].replace(" ", "")
+                for slide_idx, script in enumerate(page_scripts):
+                    if script != "해당 없음" and next_key in script.replace(" ", ""):
+                        best_slide = slide_idx
+                        break
+                if best_slide is not None:
+                    break
+
+        # 그래도 못 찾으면 해당없음이 아닌 가장 가까운 슬라이드에 붙임
+        if best_slide is None:
+            for offset in range(1, len(page_scripts)):
+                for direction in [-1, 1]:
+                    idx = len(page_scripts) // 2 + offset * direction
+                    if 0 <= idx < len(page_scripts) and page_scripts[idx] != "해당 없음":
+                        best_slide = idx
+                        break
+                if best_slide is not None:
+                    break
+
+        if best_slide is not None:
+            page_scripts[best_slide] = page_scripts[best_slide] + "\n" + missing_para
+
+    return page_scripts
 
 
 async def review_mapping(
@@ -271,115 +362,86 @@ async def review_mapping(
     lecture_info: str,
 ) -> tuple[list[str], dict]:
     """
-    맵핑 검토: 이상한 슬라이드(내용이 너무 몰리거나, 앞뒤 슬라이드와 맞지 않는 경우)를 감지하고 재배정
+    맵핑 검토: 내용이 비정상적으로 몰린 슬라이드 감지 후 재배정
     """
     total_pages = len(page_scripts)
     total_input = 0
     total_output = 0
 
-    # 문제 슬라이드 감지: 내용이 너무 많거나(>2000자), 앞뒤가 해당없음인데 혼자 내용이 많은 경우
+    # 비정상 슬라이드 감지
     problem_slides = []
     for i, script in enumerate(page_scripts):
         if script == "해당 없음":
             continue
         slide_no = i + 1
-        # 앞뒤 5개 슬라이드가 모두 해당없음인데 혼자 내용이 비정상적으로 많음
+        # 3000자 초과 or 앞뒤가 다 해당없음인데 혼자 너무 많음
         neighbors_empty = all(
             page_scripts[j] == "해당 없음"
-            for j in range(max(0, i-3), min(total_pages, i+4))
+            for j in range(max(0, i - 3), min(total_pages, i + 4))
             if j != i
         )
-        if len(script) > 1500 or neighbors_empty:
+        if len(script) > 3000 or (neighbors_empty and len(script) > 500):
             problem_slides.append(slide_no)
 
     if not problem_slides:
         return page_scripts, calculate_cost(total_input, total_output)
 
-    # 문제 슬라이드 주변 청크들을 재검토
-    # 해당 슬라이드에 배정된 청크 인덱스 찾기
-    for prob_slide in problem_slides[:5]:  # 최대 5개만 처리
-        assigned_chunks = [
-            (idx, chunks[idx]) for idx, sn in enumerate(chunk_assignments)
-            if sn == prob_slide
-        ]
-        if not assigned_chunks:
-            continue
+    for prob_slide in problem_slides[:5]:
+        script_to_review = page_scripts[prob_slide - 1]
+        start = max(0, prob_slide - 5)
+        end = min(total_pages, prob_slide + 4)
 
-        # 주변 슬라이드 텍스트
-        start = max(0, prob_slide - 4)
-        end = min(total_pages, prob_slide + 3)
         nearby_slides = "\n".join([
             f"[슬라이드 {j+1}] {' '.join(slide_texts[j].split())[:300]}"
             for j in range(start, end)
         ])
 
-        chunks_text = "\n\n".join([
-            f"[청크 {idx+1}]\n{c}" for idx, c in assigned_chunks
-        ])
-
-        prompt = f"""당신은 의학 강의 대본과 슬라이드 매핑을 검토하는 전문가입니다.
+        prompt = f"""당신은 강의 대본 맵핑을 검토하는 전문가입니다.
 
 강의: {lecture_info}
-총 슬라이드 수: {total_pages}
 
-현재 슬라이드 {prob_slide}에 아래 청크들이 모두 배정되어 있는데, 일부는 잘못 배정된 것 같습니다.
+현재 슬라이드 {prob_slide}에 아래 대본이 배정되어 있는데, 내용이 너무 많거나 주변 슬라이드 내용이 섞인 것 같습니다.
 
-[슬라이드 {prob_slide} 주변 슬라이드 목록]
+[주변 슬라이드 목록 (슬라이드 {start+1}~{end})]
 {nearby_slides}
 
-[슬라이드 {prob_slide}에 현재 배정된 청크들]
-{chunks_text}
+[현재 슬라이드 {prob_slide}에 배정된 대본]
+{script_to_review}
 
-[검토 규칙]
-1. 각 청크가 실제로 어느 슬라이드에 해당하는지 재판단하세요.
-2. 슬라이드 번호는 단조증가 유지 (슬라이드 {max(1, prob_slide-3)} ~ {min(total_pages, prob_slide+2)} 범위 내)
-3. 슬라이드와 전혀 무관하면 null
+[작업]
+위 대본을 주변 슬라이드 내용과 비교하여, 각 문단/문장이 실제로 어느 슬라이드에 해당하는지 재배정하세요.
+슬라이드 번호는 {start+1}~{end} 범위 내에서만, 반드시 오름차순으로 배정하세요.
 
-반드시 아래 JSON만 출력하세요:
+반드시 아래 JSON 형식으로만 출력하세요:
 {{
   "reassignments": [
-    {{"chunk": 청크번호, "slide_no": 슬라이드번호}},
-    ...
+    {{"slide_no": {prob_slide}, "script": "이 슬라이드에 해당하는 대본 원문"}},
+    {{"slide_no": {min(prob_slide+1, total_pages)}, "script": "다음 슬라이드에 해당하는 대본 원문"}}
   ]
 }}
 """
-        text, cost = await _generate(prompt)
+        text, cost = await _generate(prompt, model="gemini-2.5-flash-lite")
         total_input += cost["input_tokens"]
         total_output += cost["output_tokens"]
 
         try:
             clean = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
-            json_match = re.search(r"\{.*\}", clean, re.DOTALL)
+            json_match = re.search(r'\{.*\}', clean, re.DOTALL)
             if json_match:
                 data = json.loads(json_match.group())
                 for item in data.get("reassignments", []):
-                    chunk_idx = int(item["chunk"]) - 1
-                    new_sn = item.get("slide_no")
-                    if 0 <= chunk_idx < len(chunk_assignments):
-                        if new_sn is not None:
-                            new_sn = max(1, min(int(new_sn), total_pages))
-                        chunk_assignments[chunk_idx] = new_sn
+                    sn = item.get("slide_no")
+                    sc = item.get("script", "")
+                    if sn and sc and start < sn <= end:
+                        page_scripts[sn - 1] = sc
         except Exception:
             pass
 
-    # 재배정 후 슬라이드별로 다시 합치기
-    slide_chunks: dict[int, list[str]] = {i: [] for i in range(1, total_pages + 1)}
-    for idx, slide_no in enumerate(chunk_assignments):
-        if slide_no is not None and 1 <= slide_no <= total_pages:
-            slide_chunks[slide_no].append(chunks[idx])
-
-    reviewed_scripts = []
-    for i in range(1, total_pages + 1):
-        if slide_chunks[i]:
-            reviewed_scripts.append("\n".join(slide_chunks[i]))
-        else:
-            reviewed_scripts.append("해당 없음")
-
-    return reviewed_scripts, calculate_cost(total_input, total_output)
+    return page_scripts, calculate_cost(total_input, total_output)
 
 
 async def refine_page_scripts(page_scripts: list[str], lecture_info: str) -> tuple[list[str], dict]:
-    BATCH_SIZE = 10
+    BATCH_SIZE = 8
     all_refined = []
     total_input = 0
     total_output = 0
@@ -393,32 +455,32 @@ async def refine_page_scripts(page_scripts: list[str], lecture_info: str) -> tup
             for i, script in enumerate(batch)
         ])
 
-        prompt = f"""당신은 의학 전문가이자 의학과 강의 대본 정제 전문가입니다.
-아래는 {lecture_info} 강의의 슬라이드별 대본으로, 음성인식으로 생성된 텍스트입니다.
-
-[가장 중요: 음성인식 의학용어 교정]
-이 대본은 교수님 발화를 음성인식한 것이므로, 의학 용어가 한국어 발음으로 잘못 표기되어 있습니다.
-당신은 의학 전문 지식을 바탕으로 문맥을 보고 어떤 의학 용어인지 스스로 판단하여 교정하세요.
-- 모든 의학 용어(질환명, 약물명, 해부학 용어, 시술명, 검사명 등)를 정확한 영문으로 교정
-- 교정 형식: 영문(한국어) — 예: lymphoma(림프종), biopsy(생검), parietal cell(벽세포)
-- 문맥상 어떤 용어인지 명확히 판단되면 예외 없이 교정
-- 판단이 불가능한 경우만 [?원문] 표시
+        prompt = f"""당신은 의학과 강의 대본을 정제하는 전문가입니다.
+아래는 {lecture_info} 강의의 슬라이드별 대본으로, 교수님 발화를 음성인식한 텍스트입니다.
+각 슬라이드 대본을 아래 조건에 따라 정제하되, [슬라이드 N] 형식은 반드시 유지하세요.
 
 [정제 조건]
-1. 위 음성인식 교정을 최우선으로 적용
-2. 구어체 반드시 유지, 절대 요약하지 말 것
+1. 음성인식으로 잘못 표기된 의학 용어를 문맥을 보고 판단하여 정확한 영문으로 교정
+   - 교정 형식: 영문(한국어) — 예: autoimmune hepatitis(자가면역성 간염), parietal cell(벽세포)
+   - 문맥상 명확한 용어는 예외 없이 교정, 불확실하면 [?원문] 표시
+2. 콩글리시나 잘못된 영어 표현을 올바른 의학 영어로 수정
 3. 교수님 질문-학생 답변 대화 형식 유지
-4. 교수님 농담 살리기
-5. 슬라이드와 무관한 잡담/공지/사설 제거 (농담 제외)
-6. 강조/시험 출제 언급 반드시 살리기
-7. "해당 없음"인 슬라이드는 그대로 "해당 없음" 출력
+4. 불필요한 미사여구 제거, 구어체는 반드시 유지
+5. 교수님 농담은 살리기
+6. 교수님의 비유, 개인 경험담, 사례 얘기는 의학 내용 이해를 돕는 설명이므로 반드시 살릴 것
+   제거해도 되는 것: 순수 행정공지(출석, 과제 제출), 수업 진행 안내("다음 넘어가겠습니다") 정도만
+   절대 제거하면 안 되는 것: 교수님 비유/예시/경험담/농담/임상 사례 → 이건 다 살릴 것
+7. 의학용어는 영어로 + 괄호 안에 한국어 번역 (예: smallpox(천연두))
+8. 절대 요약하지 말 것, 산문 형식 유지
+9. 강조/기억하라고 한 내용 반드시 살리기
+10. "해당 없음"인 슬라이드는 그대로 "해당 없음" 출력
 
 [슬라이드별 대본]
 {combined}
 
 정제된 슬라이드별 대본만 출력하세요. [슬라이드 N] 형식 반드시 유지하면서 본문만 출력하세요.
 """
-        text, cost = await _generate(prompt)
+        text, cost = await _generate(prompt, model="gemini-2.5-flash-lite")
         total_input += cost["input_tokens"]
         total_output += cost["output_tokens"]
 
@@ -433,6 +495,85 @@ async def refine_page_scripts(page_scripts: list[str], lecture_info: str) -> tup
     return all_refined, calculate_cost(total_input, total_output)
 
 
+
+async def preprocess_script(raw_script: str, lecture_info: str, slide_texts: list[str]) -> tuple[str, dict]:
+    """
+    맵핑 전 사전처리:
+    슬라이드 텍스트를 참고해서 음성인식 대본의 의학용어를 정확하게 교정
+    슬라이드 컨텍스트를 같이 주기 때문에 "포임 → POEM(경구내시경 근절개술)" 처럼
+    강의 주제에 맞게 정확한 용어로 교정 가능
+    """
+    # 슬라이드에서 의학용어 힌트 추출 (영문 키워드 위주)
+    slide_keywords = set()
+    for text in slide_texts:
+        # 영문 단어/약어 추출
+        words = re.findall(r'[A-Z][A-Za-z0-9\-]{2,}|[A-Z]{2,}', text)
+        slide_keywords.update(words[:5])  # 슬라이드당 최대 5개
+    keyword_hint = ", ".join(sorted(slide_keywords)[:80])  # 최대 80개
+
+    # 슬라이드 텍스트 요약 (주요 의학용어 컨텍스트용)
+    slide_summary_lines = []
+    for i, text in enumerate(slide_texts):
+        text_match = re.search(r'\[텍스트\](.*?)(?=\[시각\]|\[유형\]|$)', text, re.DOTALL)
+        extracted = text_match.group(1).strip()[:200] if text_match else " ".join(text.split())[:200]
+        if extracted:
+            slide_summary_lines.append(f"슬라이드 {i+1}: {extracted}")
+    slide_summary = "\n".join(slide_summary_lines[:30])  # 최대 30개
+
+    # 대본이 너무 길면 청크로 나눠서 처리
+    CHUNK_SIZE = 8000
+    if len(raw_script) <= CHUNK_SIZE:
+        parts = [raw_script]
+    else:
+        lines = raw_script.split("\n")
+        parts = []
+        current = ""
+        for line in lines:
+            if len(current) + len(line) > CHUNK_SIZE and current:
+                parts.append(current.strip())
+                current = line
+            else:
+                current = (current + "\n" + line).strip()
+        if current:
+            parts.append(current.strip())
+
+    total_input = 0
+    total_output = 0
+    corrected_parts = []
+
+    for part in parts:
+        prompt = f"""당신은 의학 전문가입니다. 아래는 {lecture_info} 강의의 음성인식 대본입니다.
+
+[이 강의의 슬라이드 키워드 — 반드시 이 맥락에서 용어를 교정하세요]
+{keyword_hint}
+
+[슬라이드 내용 요약]
+{slide_summary}
+
+위 슬라이드 내용을 참고해서, 대본의 음성인식 오류를 교정하세요.
+예를 들어 슬라이드에 "POEM (Per-Oral Endoscopic Myotomy)"가 있다면 대본의 "포임"은 poem(시)가 아니라 POEM(경구내시경 근절개술)로 교정해야 합니다.
+
+[작업]
+1. 슬라이드 컨텍스트를 반드시 참고하여, 한국어 발음으로 표기된 의학용어를 정확한 영문으로 교정
+2. 교정 형식: 영문(한국어) 괄호 표기 — 예: autoimmune hepatitis(자가면역성 간염)
+3. 처음 등장하는 의학용어에만 괄호 표기, 이후 반복은 영문만
+4. 일반 한국어 문장은 그대로 유지, 구어체 그대로 유지
+5. 내용을 절대 요약하거나 삭제하지 말 것
+
+[원본 대본]
+{part}
+
+교정된 대본만 출력하세요. 원문의 모든 내용을 빠짐없이 유지하세요.
+"""
+        text, cost = await _generate(prompt, model="gemini-2.5-flash-lite")
+        total_input += cost["input_tokens"]
+        total_output += cost["output_tokens"]
+        corrected_parts.append(text.strip())
+
+    corrected_script = "\n\n".join(corrected_parts)
+    return corrected_script, calculate_cost(total_input, total_output)
+
+
 async def extract_emphasis(raw_script: str, lecture_info: str) -> tuple[str, dict]:
     prompt = f"""당신은 의학과 시험 준비를 돕는 전문가입니다.
 아래는 {lecture_info} 강의 대본입니다.
@@ -443,6 +584,7 @@ async def extract_emphasis(raw_script: str, lecture_info: str) -> tuple[str, dic
 - "시험에 나온다", "외워라", "반드시 알아야 한다", "중요하다", "기억해라" 등 명시적으로 강조한 의학 내용
 - 특정 수치, 메커니즘, 질환명, 용어를 반복 강조한 내용
 - "이것만큼은", "핵심은", "포인트는" 등으로 콕 집어 언급한 내용
+- 별표(★) 언급한 내용
 
 [포함하지 말 것]
 - AI, 기술 사용법, 수업 운영 방식
@@ -457,4 +599,4 @@ async def extract_emphasis(raw_script: str, lecture_info: str) -> tuple[str, dic
 
 발췌 내용만 출력하세요.
 """
-    return await _generate(prompt)
+    return await _generate(prompt, model="gemini-2.5-flash-lite")
